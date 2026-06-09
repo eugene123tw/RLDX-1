@@ -316,6 +316,29 @@ class RLDXSimPolicyWrapper(PolicyWrapper):
             if "video.wrist_image" in observation:
                 observation["video.left_wrist_view"] = observation["video.wrist_image"]
 
+        # ===== SIMPLER KEY MAPPING =====
+        # SIMPLER env adapters emit per-axis state keys, but the released
+        # checkpoints' processors expect packed end-effector keys matching the
+        # OXE training schema (end_effector_position, end_effector_rotation,
+        # gripper_position). Pack here so downstream validation + the processor
+        # see the same keys the model was trained on.
+        if all(key in observation for key in ["state.x", "state.y", "state.z"]):
+            x, y, z = observation["state.x"], observation["state.y"], observation["state.z"]
+            observation["state.end_effector_position"] = np.concatenate([x, y, z], axis=-1)
+        if all(key in observation for key in ["state.rx", "state.ry", "state.rz", "state.rw"]):
+            # SIMPLER Google: quaternion as (x, y, z, w)
+            rx, ry, rz, rw = (
+                observation["state.rx"],
+                observation["state.ry"],
+                observation["state.rz"],
+                observation["state.rw"],
+            )
+            observation["state.end_effector_rotation"] = np.concatenate(
+                [rx, ry, rz, rw], axis=-1
+            )
+        if "state.gripper" in observation and "state.gripper_position" not in observation:
+            observation["state.gripper_position"] = observation["state.gripper"]
+
         # ===== VIDEO VALIDATION =====
         # Check video modalities with flat key format: 'video.camera_name'
         for video_key in modality_configs["video"].modality_keys:
@@ -520,7 +543,7 @@ class RLDXSimPolicyWrapper(PolicyWrapper):
         action, info = self.policy.get_action(new_obs, options)
 
         # Transform actions back to flat format
-        is_libero = "state.x" in observation or "video.image" in observation
+        is_libero = "state.roll" in observation
 
         if is_libero:
             flat_actions = {}

@@ -55,13 +55,13 @@ class GoogleFractalEnv(gym.Env):
         action_high = env.action_space.high
         self.action_space = gym.spaces.Dict(
             {
-                "action.x": gym.spaces.Box(low=action_low[0], high=action_high[0], shape=(1,)),
-                "action.y": gym.spaces.Box(low=action_low[1], high=action_high[1], shape=(1,)),
-                "action.z": gym.spaces.Box(low=action_low[2], high=action_high[2], shape=(1,)),
-                "action.roll": gym.spaces.Box(low=action_low[3], high=action_high[3], shape=(1,)),
-                "action.pitch": gym.spaces.Box(low=action_low[4], high=action_high[4], shape=(1,)),
-                "action.yaw": gym.spaces.Box(low=action_low[5], high=action_high[5], shape=(1,)),
-                "action.gripper": gym.spaces.Box(
+                "action.end_effector_position": gym.spaces.Box(
+                    low=action_low[0:3], high=action_high[0:3], shape=(3,)
+                ),
+                "action.end_effector_rotation": gym.spaces.Box(
+                    low=action_low[3:6], high=action_high[3:6], shape=(3,)
+                ),
+                "action.gripper_close": gym.spaces.Box(
                     low=action_low[6], high=action_high[6], shape=(1,)
                 ),
             }
@@ -84,15 +84,20 @@ class GoogleFractalEnv(gym.Env):
         return observation, info
 
     def step(self, action):
+        # Packed action format emitted by RLDXSimPolicyWrapper for the
+        # OXE-Fractal-schema policy: end_effector_position (3D delta xyz),
+        # end_effector_rotation (3D axis-angle delta), gripper_close (1D).
+        pos = action["action.end_effector_position"]
+        rot = action["action.end_effector_rotation"]
         action_vector = np.concatenate(
             [
-                action["action.x"],
-                action["action.y"],
-                action["action.z"],
-                action["action.roll"],
-                action["action.pitch"],
-                action["action.yaw"],
-                self._postprocess_gripper(action["action.gripper"]),
+                pos[..., 0:1],
+                pos[..., 1:2],
+                pos[..., 2:3],
+                rot[..., 0:1],
+                rot[..., 1:2],
+                rot[..., 2:3],
+                self._postprocess_gripper(action["action.gripper_close"]),
             ],
             axis=0,
         )
@@ -162,13 +167,13 @@ class WidowXBridgeEnv(gym.Env):
         action_high = env.action_space.high
         self.action_space = gym.spaces.Dict(
             {
-                "action.x": gym.spaces.Box(low=action_low[0], high=action_high[0], shape=(1,)),
-                "action.y": gym.spaces.Box(low=action_low[1], high=action_high[1], shape=(1,)),
-                "action.z": gym.spaces.Box(low=action_low[2], high=action_high[2], shape=(1,)),
-                "action.roll": gym.spaces.Box(low=action_low[3], high=action_high[3], shape=(1,)),
-                "action.pitch": gym.spaces.Box(low=action_low[4], high=action_high[4], shape=(1,)),
-                "action.yaw": gym.spaces.Box(low=action_low[5], high=action_high[5], shape=(1,)),
-                "action.gripper": gym.spaces.Box(
+                "action.end_effector_position": gym.spaces.Box(
+                    low=action_low[0:3], high=action_high[0:3], shape=(3,)
+                ),
+                "action.end_effector_rotation": gym.spaces.Box(
+                    low=action_low[3:6], high=action_high[3:6], shape=(3,)
+                ),
+                "action.gripper_close": gym.spaces.Box(
                     low=action_low[6], high=action_high[6], shape=(1,)
                 ),
             }
@@ -184,15 +189,20 @@ class WidowXBridgeEnv(gym.Env):
         return observation, info
 
     def step(self, action):
+        # Packed action format emitted by RLDXSimPolicyWrapper for the
+        # OXE-bridge_orig-schema policy: end_effector_position (3D delta xyz),
+        # end_effector_rotation (3D euler delta), gripper_close (1D).
+        pos = action["action.end_effector_position"]
+        rot = action["action.end_effector_rotation"]
         action_vector = np.concatenate(
             [
-                action["action.x"],
-                action["action.y"],
-                action["action.z"],
-                action["action.roll"],
-                action["action.pitch"],
-                action["action.yaw"],
-                self._postprocess_gripper(action["action.gripper"]),
+                pos[..., 0:1],
+                pos[..., 1:2],
+                pos[..., 2:3],
+                rot[..., 0:1],
+                rot[..., 1:2],
+                rot[..., 2:3],
+                self._postprocess_gripper(action["action.gripper_close"]),
             ],
             axis=0,
         )

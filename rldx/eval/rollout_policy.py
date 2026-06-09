@@ -254,6 +254,8 @@ def get_gym_env(
             env_fn = get_simpler_env_fn(env_name)
         elif env_embodiment in (EmbodimentTag.BEHAVIOR_R1_PRO,):
             env_fn = get_behavior_env_fn(env_name, env_idx, total_n_envs)
+        elif env_embodiment in (EmbodimentTag.OXE_BRIDGE_ORIG,):
+            env_fn = get_simpler_env_fn(env_name)
         else:
             raise ValueError(f"Invalid environment name: {env_name}")
 

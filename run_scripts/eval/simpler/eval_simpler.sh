@@ -89,7 +89,6 @@ uv run python rldx/eval/run_rldx_server.py \
     --model-path "$MODEL_PATH" \
     --embodiment-tag "$EMBODIMENT_TAG" \
     --use-sim-policy-wrapper \
-    --num-inference-timesteps "$DENOISE_STEP" \
     --host 127.0.0.1 --port "$PORT" &
 SERVE_PID=$!
 trap 'kill "$SERVE_PID" 2>/dev/null || true' EXIT

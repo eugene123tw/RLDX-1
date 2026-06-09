@@ -63,7 +63,18 @@ uv pip install -e "$SIMPLER_REPO"
 # Make your OSS project importable
 uv pip install --editable "$PROJECT_REPO" --no-deps
 
-uv pip install tianshou==0.5.1 pydantic av zmq torchvision==0.22.0 transformers==4.51.3
+# rldx import-time deps. Installed explicitly (rather than via the rldx
+# extras) so SimplerEnv's pinned versions of numpy / opencv / gymnasium
+# are preserved. transformers must match the rldx pin (4.57.0) because
+# rldx.model.modules.backbone.modeling_qwen3_vl imports
+# transformers.masking_utils, added in 4.55+. SimplerEnv only uses
+# AutoTokenizer from transformers and has no upper bound.
+uv pip install tianshou==0.5.1 pydantic av zmq torchvision==0.22.0 transformers==4.57.0 \
+  tyro==0.9.17 einops==0.8.1 omegaconf==2.3.0 termcolor==3.2.0 \
+  peft==0.17.1 diffusers==0.35.1 accelerate safetensors huggingface-hub \
+  deepspeed==0.17.6 wandb==0.23.0 msgpack==1.1.0 msgpack-numpy==0.4.8 \
+  albumentations==1.4.18 dm-tree==0.1.8 lmdb==1.7.5 datasets==3.6.0 \
+  click==8.1.8 PyYAML packaging requests websockets pandas
 
 # Sanity check
 python - <<'PY'
