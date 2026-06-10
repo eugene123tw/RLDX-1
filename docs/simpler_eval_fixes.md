@@ -8,7 +8,10 @@ Affected files:
 
 - [rldx/eval/sim/SimplerEnv/setup_SimplerEnv.sh](rldx/eval/sim/SimplerEnv/setup_SimplerEnv.sh)
 - [rldx/eval/sim/SimplerEnv/simpler_env.py](rldx/eval/sim/SimplerEnv/simpler_env.py)
+- [rldx/eval/sim/LIBERO/libero_env.py](rldx/eval/sim/LIBERO/libero_env.py)
+- [rldx/eval/sim/LIBERO_PLUS/libero_plus_env.py](rldx/eval/sim/LIBERO_PLUS/libero_plus_env.py)
 - [rldx/policy/rldx_policy.py](rldx/policy/rldx_policy.py)
+- [rldx/model/core/processing_rldx.py](rldx/model/core/processing_rldx.py)
 - [rldx/eval/rollout_policy.py](rldx/eval/rollout_policy.py)
 - [run_scripts/eval/simpler/eval_simpler.sh](run_scripts/eval/simpler/eval_simpler.sh)
 
@@ -161,15 +164,105 @@ Server boots, rollouts step through SIMPLER without `KeyError`s, and the
 policy receives the OXE-schema observations / emits the OXE-schema actions
 that the released checkpoint was trained on.
 
+---
+
+## 8. Refactor — envs own their I/O schema (supersedes #4–#7)
+
+**Issue.** Fixes #4–#7 patched the symptoms by accumulating per-embodiment
+shim blocks inside `RLDXSimPolicyWrapper` (two duplicated SIMPLER/LIBERO
+key-packing blocks in `check_observation` and `_get_action`, plus an
+`is_libero = "state.roll" in observation` action sentinel). The wrapper had
+to know per-embodiment quirks; envs were emitting per-axis state keys that
+no consumer ever used.
+
+The same approach also did **not** cover WidowX state rotation: the SIMPLER
+mapping block only packed `state.end_effector_rotation` from quaternion keys
+(`state.rx/ry/rz/rw`), so the Bridge env — which emits Euler
+`state.roll/pitch/yaw` — still raised
+`AssertionError: State key 'state.end_effector_rotation' must be in
+observation` (the "WidowX state rotation" follow-up below).
+
+**Fix.** Move all schema knowledge into the envs and make the wrapper
+embodiment-agnostic:
+
+- `GoogleFractalEnv` / `WidowXBridgeEnv`
+  ([rldx/eval/sim/SimplerEnv/simpler_env.py](rldx/eval/sim/SimplerEnv/simpler_env.py))
+  emit packed OXE keys directly from `_process_observation`:
+  `state.end_effector_position` (3D), `state.end_effector_rotation`
+  (4D quat xyzw for Google, 3D euler for WidowX), `state.gripper_position`.
+  Per-axis / `state.pad` keys are removed. `gym.spaces.Dict` declares the
+  same packed keys.
+- `LiberoEnv` / `LiberoPlusEnv`
+  ([rldx/eval/sim/LIBERO/libero_env.py](rldx/eval/sim/LIBERO/libero_env.py),
+  [rldx/eval/sim/LIBERO_PLUS/libero_plus_env.py](rldx/eval/sim/LIBERO_PLUS/libero_plus_env.py))
+  emit `video.front_view`, `video.left_wrist_view`, `state.eef_pos_absolute`
+  (3D), `state.eef_rot_absolute` (3D), `state.gripper_close` (2D). `step()`
+  reads `action.eef_pos_delta`, `action.eef_rot_delta`, `action.gripper_close`
+  and applies the `1 - gripper_close` flip locally (previously done in the
+  wrapper).
+- `RLDXSimPolicyWrapper` ([rldx/policy/rldx_policy.py](rldx/policy/rldx_policy.py))
+  loses both `===== LIBERO KEY MAPPING =====` blocks, the `===== SIMPLER KEY
+  MAPPING =====` block, and the `is_libero` action-unpacking branch. The
+  action transform is now unconditionally
+  `flat_actions = {f"action.{key}": action[key] for key in action}`.
+  The GR-1 / RoboCasa video-key fallbacks remain (those envs were not part of
+  this refactor).
+
+The wrapper now contains no per-embodiment logic; adding a new SIMPLER /
+LIBERO variant no longer requires editing `rldx_policy.py`. Per-axis state
+keys (`state.x/y/z/rx/ry/rz/rw/roll/pitch/yaw/pad/gripper`) and the LIBERO
+per-axis action keys (`action.x/y/z/roll/pitch/yaw/gripper`) are no longer
+emitted anywhere in the repo.
+
+---
+
+## 9. Defensive default for `image_max_area=None` in checkpoints
+
+**Issue.** `RLWRLD/RLDX-1-FT-SIMPLER-WIDOWX`'s `processor_config.json`
+persists `"image_max_area": null` (and `"image_resize_m": 32`). At inference,
+the WidowX env feeds 256×256 frames into the image pipeline, which lands in
+`resize_preserve_aspect_area_then_crop` and crashes with:
+
+```
+TypeError: unsupported operand type(s) for /: 'NoneType' and 'int'
+```
+
+`image_max_area` is annotated as `int` everywhere and has no `is None`
+fallback — only `random_crop_fraction` / `random_rotation_angle` /
+`color_jitter_params` are honestly optional. The `null` slipped into the
+JSON via an older training recipe that never tripped the `sqrt(area / hw)`
+path (`max_area=65536` is a no-op for 256×256 inputs, so training silently
+"worked").
+
+**Fix.** In `RLDXProcessor.__init__`
+([rldx/model/core/processing_rldx.py](rldx/model/core/processing_rldx.py)),
+coerce `None → default` for both `image_max_area` (65536) and
+`image_resize_m` (32) with a rank-zero warning. Recovered defaults match the
+in-repo training defaults
+([rldx/configs/train_config.py](rldx/configs/train_config.py); the sibling
+[run_scripts/train/benchmarks/finetune_rldx1_simpler_google.sh](run_scripts/train/benchmarks/finetune_rldx1_simpler_google.sh)
+passes `--image-max-area 65536` explicitly, and the WidowX script relies on
+the same dataclass default). For 256×256 inputs both values are no-ops, so
+inference now reproduces training behavior bit-exactly.
+
+The next bad checkpoint will print:
+
+```
+[!] processor: image_max_area=None in checkpoint; falling back to default 65536. Set it explicitly to silence.
+```
+
+instead of crashing inside albumentations.
+
 ## Known follow-ups (not blockers)
 
 - **Quaternion ordering — verified xyzw.** The allenzren `ManiSkill2_real2sim`
   fork returns `eef_pos` proprio as `[x, y, z, qw, qx, qy, qz, gripper]`
-  (wxyz). The SimplerEnv adapter `_process_observation` already converts to
-  xyzw via `np.roll(proprio[3:7], -1)` and stores it under `state.rx/ry/rz/rw`
-  with `rw` as the scalar. Fix #4 concatenates `[rx, ry, rz, rw]` in that
-  same xyzw order, matching the OXE Fractal training convention. Do not swap
-  to wxyz unless rollouts demonstrably show wrong rotations.
-- **WidowX state rotation.** Bridge emits Euler `state.roll/pitch/yaw`, not a
-  quaternion. A separate euler→quaternion (or euler→packed-rotation) shim is
-  needed for `OXE_BRIDGE_ORIG` and is not part of this changeset.
+  (wxyz). The Google adapter `_process_observation` converts to xyzw via
+  `np.roll(proprio[3:7], -1)` and emits it as the 4D
+  `state.end_effector_rotation`, matching the OXE Fractal training
+  convention. Do not swap to wxyz unless rollouts demonstrably show wrong
+  rotations.
+- ~~**WidowX state rotation.**~~ **Resolved by #8.** Bridge emits Euler
+  `state.roll/pitch/yaw`; the WidowX env now packs them directly into the
+  3D `state.end_effector_rotation` expected by the `simpler_widowx` modality
+  config, no wrapper-side shim needed.
