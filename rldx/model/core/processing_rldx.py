@@ -274,7 +274,25 @@ class RLDXProcessor(BaseProcessor):
         self.max_action_dim = max_action_dim
         self.max_action_horizon = max_action_horizon
 
-        # Save image pipeline settings
+        # Save image pipeline settings. Some legacy checkpoints persisted
+        # ``image_max_area`` / ``image_resize_m`` as ``null`` because the
+        # training recipe that produced them never tripped the
+        # ``math.sqrt(max_area / (h * w))`` path (256x256 inputs are a no-op
+        # at the default 65536 budget). At inference we still need a concrete
+        # int, so coerce here and warn loudly instead of crashing later inside
+        # albumentations.
+        if image_max_area is None:
+            _print(
+                f"[!] processor: image_max_area=None in checkpoint; "
+                f"falling back to default {65536}. Set it explicitly to silence."
+            )
+            image_max_area = 65536
+        if image_resize_m is None:
+            _print(
+                f"[!] processor: image_resize_m=None in checkpoint; "
+                f"falling back to default {32}. Set it explicitly to silence."
+            )
+            image_resize_m = 32
         self.image_max_area = image_max_area
         self.image_resize_m = image_resize_m
         self.random_crop_fraction = random_crop_fraction

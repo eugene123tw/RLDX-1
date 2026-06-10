@@ -64,29 +64,23 @@ class LiberoPlusEnv(gym.Env):
         self._init_states = init_states
         self.observation_space = gym.spaces.Dict(
             {
-                "video.image": gym.spaces.Box(low=0, high=255, shape=(256, 256, 3), dtype=np.uint8),
-                "video.wrist_image": gym.spaces.Box(
+                "video.front_view": gym.spaces.Box(
                     low=0, high=255, shape=(256, 256, 3), dtype=np.uint8
                 ),
-                "state.x": gym.spaces.Box(low=-1, high=1, shape=(1,)),
-                "state.y": gym.spaces.Box(low=-1, high=1, shape=(1,)),
-                "state.z": gym.spaces.Box(low=-1, high=1, shape=(1,)),
-                "state.roll": gym.spaces.Box(low=-1, high=1, shape=(1,)),
-                "state.pitch": gym.spaces.Box(low=-1, high=1, shape=(1,)),
-                "state.yaw": gym.spaces.Box(low=-1, high=1, shape=(1,)),
-                "state.gripper": gym.spaces.Box(low=-1, high=1, shape=(2,)),
+                "video.left_wrist_view": gym.spaces.Box(
+                    low=0, high=255, shape=(256, 256, 3), dtype=np.uint8
+                ),
+                "state.eef_pos_absolute": gym.spaces.Box(low=-1, high=1, shape=(3,)),
+                "state.eef_rot_absolute": gym.spaces.Box(low=-np.pi, high=np.pi, shape=(3,)),
+                "state.gripper_close": gym.spaces.Box(low=-1, high=1, shape=(2,)),
                 "annotation.human.action.task_description": gym.spaces.Text(max_length=512),
             }
         )
         self.action_space = spaces.Dict(
             {
-                "action.x": spaces.Box(low=-1, high=1, shape=(1,)),
-                "action.y": spaces.Box(low=-1, high=1, shape=(1,)),
-                "action.z": spaces.Box(low=-1, high=1, shape=(1,)),
-                "action.roll": spaces.Box(low=-1, high=1, shape=(1,)),
-                "action.pitch": spaces.Box(low=-1, high=1, shape=(1,)),
-                "action.yaw": spaces.Box(low=-1, high=1, shape=(1,)),
-                "action.gripper": spaces.Box(low=-1, high=1, shape=(1,)),
+                "action.eef_pos_delta": spaces.Box(low=-1, high=1, shape=(3,)),
+                "action.eef_rot_delta": spaces.Box(low=-1, high=1, shape=(3,)),
+                "action.gripper_close": spaces.Box(low=0, high=1, shape=(1,)),
             }
         )
 
@@ -98,15 +92,11 @@ class LiberoPlusEnv(gym.Env):
         rpy = quat2axisangle(obs["robot0_eef_quat"])
         gripper = obs["robot0_gripper_qpos"]
         return {
-            "video.image": obs["agentview_image"][::-1, ::-1],
-            "video.wrist_image": obs["robot0_eye_in_hand_image"][::-1, ::-1],
-            "state.x": [xyz[0]],
-            "state.y": [xyz[1]],
-            "state.z": [xyz[2]],
-            "state.roll": [rpy[0]],
-            "state.pitch": [rpy[1]],
-            "state.yaw": [rpy[2]],
-            "state.gripper": gripper,
+            "video.front_view": obs["agentview_image"][::-1, ::-1],
+            "video.left_wrist_view": obs["robot0_eye_in_hand_image"][::-1, ::-1],
+            "state.eef_pos_absolute": np.asarray(xyz, dtype=np.float32),
+            "state.eef_rot_absolute": np.asarray(rpy, dtype=np.float32),
+            "state.gripper_close": np.asarray(gripper, dtype=np.float32),
             "annotation.human.action.task_description": self._task_description,
         }
 
@@ -119,15 +109,15 @@ class LiberoPlusEnv(gym.Env):
         return observation, info
 
     def step(self, action):
+        # The policy emits ``action.gripper_close`` in [0, 1] where 1 means
+        # close; LIBERO's controller expects the inverse convention before the
+        # normalize+invert pipeline, hence the ``1.0 - x`` flip below.
+        gripper = 1.0 - action["action.gripper_close"]
         action_vector = np.concatenate(
             [
-                action["action.x"],
-                action["action.y"],
-                action["action.z"],
-                action["action.roll"],
-                action["action.pitch"],
-                action["action.yaw"],
-                action["action.gripper"],
+                action["action.eef_pos_delta"],
+                action["action.eef_rot_delta"],
+                gripper,
             ],
             axis=0,
         )

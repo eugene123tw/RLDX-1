@@ -297,48 +297,6 @@ class RLDXSimPolicyWrapper(PolicyWrapper):
         """
         modality_configs = self.get_modality_config()
 
-        # ===== LIBERO KEY MAPPING =====
-        if "state.x" in observation:
-            if all(key in observation for key in ["state.x", "state.y", "state.z"]):
-                x, y, z = observation["state.x"], observation["state.y"], observation["state.z"]
-                observation["state.eef_pos_absolute"] = np.concatenate([x, y, z], axis=-1)
-            if all(key in observation for key in ["state.roll", "state.pitch", "state.yaw"]):
-                roll, pitch, yaw = (
-                    observation["state.roll"],
-                    observation["state.pitch"],
-                    observation["state.yaw"],
-                )
-                observation["state.eef_rot_absolute"] = np.concatenate([roll, pitch, yaw], axis=-1)
-            if "state.gripper" in observation:
-                observation["state.gripper_close"] = observation["state.gripper"]
-            if "video.image" in observation:
-                observation["video.front_view"] = observation["video.image"]
-            if "video.wrist_image" in observation:
-                observation["video.left_wrist_view"] = observation["video.wrist_image"]
-
-        # ===== SIMPLER KEY MAPPING =====
-        # SIMPLER env adapters emit per-axis state keys, but the released
-        # checkpoints' processors expect packed end-effector keys matching the
-        # OXE training schema (end_effector_position, end_effector_rotation,
-        # gripper_position). Pack here so downstream validation + the processor
-        # see the same keys the model was trained on.
-        if all(key in observation for key in ["state.x", "state.y", "state.z"]):
-            x, y, z = observation["state.x"], observation["state.y"], observation["state.z"]
-            observation["state.end_effector_position"] = np.concatenate([x, y, z], axis=-1)
-        if all(key in observation for key in ["state.rx", "state.ry", "state.rz", "state.rw"]):
-            # SIMPLER Google: quaternion as (x, y, z, w)
-            rx, ry, rz, rw = (
-                observation["state.rx"],
-                observation["state.ry"],
-                observation["state.rz"],
-                observation["state.rw"],
-            )
-            observation["state.end_effector_rotation"] = np.concatenate(
-                [rx, ry, rz, rw], axis=-1
-            )
-        if "state.gripper" in observation and "state.gripper_position" not in observation:
-            observation["state.gripper_position"] = observation["state.gripper"]
-
         # ===== VIDEO VALIDATION =====
         # Check video modalities with flat key format: 'video.camera_name'
         for video_key in modality_configs["video"].modality_keys:
@@ -470,25 +428,6 @@ class RLDXSimPolicyWrapper(PolicyWrapper):
         Returns:
             Tuple of (flat_actions_dict, info_dict)
         """
-        # ===== LIBERO KEY MAPPING =====
-        if "state.x" in observation:
-            if all(key in observation for key in ["state.x", "state.y", "state.z"]):
-                x, y, z = observation["state.x"], observation["state.y"], observation["state.z"]
-                observation["state.eef_pos_absolute"] = np.concatenate([x, y, z], axis=-1)
-            if all(key in observation for key in ["state.roll", "state.pitch", "state.yaw"]):
-                roll, pitch, yaw = (
-                    observation["state.roll"],
-                    observation["state.pitch"],
-                    observation["state.yaw"],
-                )
-                observation["state.eef_rot_absolute"] = np.concatenate([roll, pitch, yaw], axis=-1)
-            if "state.gripper" in observation:
-                observation["state.gripper_close"] = observation["state.gripper"]
-            if "video.image" in observation:
-                observation["video.front_view"] = observation["video.image"]
-            if "video.wrist_image" in observation:
-                observation["video.left_wrist_view"] = observation["video.wrist_image"]
-
         # ===== GR-1 / RoboCasa video key fallbacks =====
         # The GR-1 sim env (GrootRoboCasaEnv) and RoboCasa365 produce camera
         # keys with long suffixes (e.g. ``video.ego_view_pad_res256_freq20``),
@@ -542,25 +481,11 @@ class RLDXSimPolicyWrapper(PolicyWrapper):
         # Compute actions using the underlying RLDXPolicy
         action, info = self.policy.get_action(new_obs, options)
 
-        # Transform actions back to flat format
-        is_libero = "state.roll" in observation
-
-        if is_libero:
-            flat_actions = {}
-            if "eef_pos_delta" in action:
-                pos_delta = action["eef_pos_delta"]
-                flat_actions["action.x"] = pos_delta[..., 0:1]
-                flat_actions["action.y"] = pos_delta[..., 1:2]
-                flat_actions["action.z"] = pos_delta[..., 2:3]
-            if "eef_rot_delta" in action:
-                rot_delta = action["eef_rot_delta"]
-                flat_actions["action.roll"] = rot_delta[..., 0:1]
-                flat_actions["action.pitch"] = rot_delta[..., 1:2]
-                flat_actions["action.yaw"] = rot_delta[..., 2:3]
-            if "gripper_close" in action:
-                flat_actions["action.gripper"] = 1.0 - action["gripper_close"]
-        else:
-            flat_actions = {f"action.{key}": action[key] for key in action}
+        # Transform actions back to flat format. All sim envs now consume the
+        # policy's native action key names (e.g. ``action.eef_pos_delta``,
+        # ``action.end_effector_position``) and handle any per-embodiment
+        # unpacking themselves in ``step()``.
+        flat_actions = {f"action.{key}": action[key] for key in action}
 
         return flat_actions, info
 

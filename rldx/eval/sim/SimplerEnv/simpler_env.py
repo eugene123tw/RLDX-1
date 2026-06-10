@@ -30,9 +30,6 @@ class GoogleFractalEnv(gym.Env):
         env = simpler_env.make(env_name)
         env._max_episode_steps = 10000
         self.env = env
-        agent_space = env.observation_space["agent"]
-        print("[SimplerEnv] agent space keys:", list(agent_space.spaces.keys()))
-        # assert False
         obs_low = env.observation_space["agent"]["eef_pos"].low
         obs_high = env.observation_space["agent"]["eef_pos"].high
         self.observation_space = gym.spaces.Dict(
@@ -40,14 +37,15 @@ class GoogleFractalEnv(gym.Env):
                 "video.image": gym.spaces.Box(
                     low=0, high=255, shape=(image_size[0], image_size[1], 3), dtype=np.uint8
                 ),
-                "state.x": gym.spaces.Box(low=obs_low[0], high=obs_high[0], shape=(1,)),
-                "state.y": gym.spaces.Box(low=obs_low[1], high=obs_high[1], shape=(1,)),
-                "state.z": gym.spaces.Box(low=obs_low[2], high=obs_high[2], shape=(1,)),
-                "state.rx": gym.spaces.Box(low=obs_low[3], high=obs_high[3], shape=(1,)),
-                "state.ry": gym.spaces.Box(low=obs_low[4], high=obs_high[4], shape=(1,)),
-                "state.rz": gym.spaces.Box(low=obs_low[5], high=obs_high[5], shape=(1,)),
-                "state.rw": gym.spaces.Box(low=obs_low[6], high=obs_high[6], shape=(1,)),
-                "state.gripper": gym.spaces.Box(low=obs_low[7], high=obs_high[7], shape=(1,)),
+                "state.end_effector_position": gym.spaces.Box(
+                    low=obs_low[0:3], high=obs_high[0:3], shape=(3,)
+                ),
+                "state.end_effector_rotation": gym.spaces.Box(
+                    low=obs_low[3:7], high=obs_high[3:7], shape=(4,)
+                ),
+                "state.gripper_position": gym.spaces.Box(
+                    low=obs_low[7], high=obs_high[7], shape=(1,)
+                ),
                 "annotation.human.action.task_description": gym.spaces.Text(max_length=512),
             }
         )
@@ -109,18 +107,15 @@ class GoogleFractalEnv(gym.Env):
     def _process_observation(self, obs):
         img = get_image_from_maniskill2_obs_dict(self.env, obs)
         proprio = obs["agent"]["eef_pos"]
-        qunat_xyzw = np.roll(proprio[3:7], -1)
+        # SIMPLER stores quaternion as (w, x, y, z); the OXE Fractal schema
+        # expects (x, y, z, w).
+        quat_xyzw = np.roll(proprio[3:7], -1)
         gripper_closedness = 1 - proprio[7]
         return {
             "video.image": cv2.resize(img, (self.image_size[1], self.image_size[0])),
-            "state.x": [proprio[0]],
-            "state.y": [proprio[1]],
-            "state.z": [proprio[2]],
-            "state.rx": [qunat_xyzw[0]],
-            "state.ry": [qunat_xyzw[1]],
-            "state.rz": [qunat_xyzw[2]],
-            "state.rw": [qunat_xyzw[3]],
-            "state.gripper": [gripper_closedness],
+            "state.end_effector_position": np.asarray(proprio[0:3], dtype=np.float32),
+            "state.end_effector_rotation": np.asarray(quat_xyzw, dtype=np.float32),
+            "state.gripper_position": np.asarray([gripper_closedness], dtype=np.float32),
             "annotation.human.action.task_description": self.env.unwrapped.get_language_instruction(),
         }
 
@@ -152,14 +147,15 @@ class WidowXBridgeEnv(gym.Env):
                 "video.image_0": gym.spaces.Box(
                     low=0, high=255, shape=(image_size[0], image_size[1], 3), dtype=np.uint8
                 ),
-                "state.x": gym.spaces.Box(low=obs_low[0], high=obs_high[0], shape=(1,)),
-                "state.y": gym.spaces.Box(low=obs_low[1], high=obs_high[1], shape=(1,)),
-                "state.z": gym.spaces.Box(low=obs_low[2], high=obs_high[2], shape=(1,)),
-                "state.roll": gym.spaces.Box(low=obs_low[3], high=obs_high[3], shape=(1,)),
-                "state.pitch": gym.spaces.Box(low=obs_low[4], high=obs_high[4], shape=(1,)),
-                "state.yaw": gym.spaces.Box(low=obs_low[5], high=obs_high[5], shape=(1,)),
-                "state.pad": gym.spaces.Box(low=obs_low[6], high=obs_high[6], shape=(1,)),
-                "state.gripper": gym.spaces.Box(low=obs_low[7], high=obs_high[7], shape=(1,)),
+                "state.end_effector_position": gym.spaces.Box(
+                    low=obs_low[0:3], high=obs_high[0:3], shape=(3,)
+                ),
+                "state.end_effector_rotation": gym.spaces.Box(
+                    low=-np.pi, high=np.pi, shape=(3,)
+                ),
+                "state.gripper_position": gym.spaces.Box(
+                    low=obs_low[7], high=obs_high[7], shape=(1,)
+                ),
                 "annotation.human.action.task_description": gym.spaces.Text(max_length=512),
             }
         )
@@ -218,14 +214,9 @@ class WidowXBridgeEnv(gym.Env):
         rpy_bridge_converted = te.mat2euler(rm_bridge @ self.default_rot.T)
         return {
             "video.image_0": cv2.resize(img, (self.image_size[1], self.image_size[0])),
-            "state.x": [proprio[0]],
-            "state.y": [proprio[1]],
-            "state.z": [proprio[2]],
-            "state.roll": [rpy_bridge_converted[0]],
-            "state.pitch": [rpy_bridge_converted[1]],
-            "state.yaw": [rpy_bridge_converted[2]],
-            "state.pad": [0],
-            "state.gripper": [proprio[7]],
+            "state.end_effector_position": np.asarray(proprio[0:3], dtype=np.float32),
+            "state.end_effector_rotation": np.asarray(rpy_bridge_converted, dtype=np.float32),
+            "state.gripper_position": np.asarray([proprio[7]], dtype=np.float32),
             "annotation.human.action.task_description": self.env.unwrapped.get_language_instruction(),
         }
 
