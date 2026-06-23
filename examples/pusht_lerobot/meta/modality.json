@@ -1,0 +1,11 @@
+{
+    "state": {
+        "agent_pos": { "start": 0, "end": 2 }
+    },
+    "action": {
+        "agent_pos": { "start": 0, "end": 2 }
+    },
+    "video": {
+        "image": { "original_key": "observation.image" }
+    }
+}
