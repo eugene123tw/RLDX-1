@@ -27,6 +27,11 @@ Usage:
 Args:
     dataset_path: Path to the dataset.
     embodiment_tag: Embodiment tag to use to load modality configurations from `rldx/configs/data/embodiment_configs.py`.
+    modality_config_path: Optional path to a Python file that registers a modality
+        config (via `register_modality_config`). Required for embodiments that are
+        not baked into `embodiment_configs.py` but registered dynamically
+        (e.g. `pusht`, `simpler_widowx`). Mirrors the `--modality-config-path`
+        flag of the training launcher.
 """
 
 import json
@@ -38,6 +43,7 @@ from tqdm import tqdm
 
 from rldx.configs.data.embodiment_configs import MODALITY_CONFIGS
 from rldx.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
+from rldx.experiment.utils import load_modality_config
 from rldx.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
 from rldx.data.state_action.pose import EndEffectorPose, JointPose
 from rldx.data.types import ActionRepresentation, ActionType, EmbodimentTag, ModalityConfig
@@ -244,6 +250,15 @@ def calculate_stats_for_key(
 
 def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) -> None:
     dataset_path = Path(dataset_path)
+    if embodiment_tag.value not in MODALITY_CONFIGS:
+        # The embodiment config was registered dynamically and not loaded here.
+        # Pass --modality-config-path to compute relative stats. Skip otherwise —
+        # relative stats are only needed for RELATIVE action representations.
+        print(
+            f"[i] Skipping relative stats: '{embodiment_tag.value}' not in MODALITY_CONFIGS "
+            f"(pass --modality-config-path to enable)."
+        )
+        return
     action_config = MODALITY_CONFIGS[embodiment_tag.value]["action"]
     if action_config.action_configs is None:
         return
@@ -267,7 +282,15 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
         json.dump(to_json_serializable(dict(stats)), f, indent=4)
 
 
-def main(dataset_path: Path | str, embodiment_tag: EmbodimentTag):
+def main(
+    dataset_path: Path | str,
+    embodiment_tag: EmbodimentTag,
+    modality_config_path: str | None = None,
+):
+    # Load configs registered dynamically (e.g. pusht, simpler_widowx) so the
+    # embodiment tag is present in MODALITY_CONFIGS before computing rel stats.
+    if modality_config_path is not None:
+        load_modality_config(modality_config_path)
     generate_stats(dataset_path)
     generate_rel_stats(dataset_path, embodiment_tag)
 

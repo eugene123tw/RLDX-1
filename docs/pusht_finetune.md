@@ -21,7 +21,8 @@ uv run python download_pusht.py
 # 2. Add the required meta files (modality.json is committed; generate stats.json)
 uv run python rldx/data/stats.py \
     --dataset-path examples/pusht_lerobot \
-    --embodiment-tag GENERAL_EMBODIMENT   # harmless KeyError at the end — see note
+    --embodiment-tag GENERAL_EMBODIMENT \
+    --modality-config-path rldx/configs/data/pusht_config.py
 
 # 3. Validate the dataset loads through RLDX-1's loader
 uv run python validate_pusht_config.py
@@ -87,16 +88,17 @@ The joint-group names (`agent_pos`, `image`) must match the
 ```bash
 uv run python rldx/data/stats.py \
     --dataset-path examples/pusht_lerobot \
-    --embodiment-tag GENERAL_EMBODIMENT
+    --embodiment-tag GENERAL_EMBODIMENT \
+    --modality-config-path rldx/configs/data/pusht_config.py
 ```
 
-> **Note** — this command computes and writes `stats.json` successfully, then
-> crashes at the very end with `KeyError: 'general_embodiment'` inside
-> `generate_rel_stats`. This is **harmless**. The dynamically-registered
-> Push-T config is not present in the static `MODALITY_CONFIGS` dict, but
-> relative-action stats are only needed for `RELATIVE` action
-> representations — Push-T uses `ABSOLUTE`, so the missing rel-stats are
-> never used. `stats.json` is already on disk by the time it fails.
+> **Why `--modality-config-path`** — the Push-T config is registered
+> dynamically via `register_modality_config` (like `simpler_widowx`), so it is
+> not present in the static `MODALITY_CONFIGS` dict that `stats.py` imports.
+> Without this flag the relative-stats step raises
+> `KeyError: 'general_embodiment'`. Passing the config path loads it the same
+> way the training launcher does. Push-T uses only `ABSOLUTE` actions, so no
+> relative stats are written — but the run exits cleanly.
 
 ## Dataset facts
 
