@@ -353,6 +353,10 @@ class TrainConfig:
     gradient_accumulation_steps: int = 1
     """Number of forward passes to accumulate before performing a backward/update step."""
 
+    gradient_checkpointing: bool = False
+    """If True, enable activation checkpointing to reduce GPU memory usage during training.
+    This trades extra compute for lower memory footprint."""
+
     max_grad_norm: float = 1.0
     """Gradient clipping threshold (passed to ``TrainingArguments.max_grad_norm``)."""
 

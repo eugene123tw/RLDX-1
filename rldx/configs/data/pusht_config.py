@@ -63,6 +63,10 @@ pusht = {
             ),
         ],
     ),
+    "language": ModalityConfig(
+        delta_indices=[0],
+        modality_keys=["task"],  # Synthesized from meta/tasks.jsonl by LeRobotEpisodeLoader
+    ),
 }
 
 

@@ -359,6 +359,7 @@ def _apply_training_overrides(
     run_config.training.learning_rate = cli.learning_rate
     run_config.training.lr_scheduler_type = cli.lr_scheduler_type
     run_config.training.gradient_accumulation_steps = cli.gradient_accumulation_steps
+    run_config.training.gradient_checkpointing = cli.gradient_checkpointing
     run_config.training.output_dir = cli.output_dir
     run_config.training.save_steps = cli.save_steps
     run_config.training.save_total_limit = cli.save_total_limit

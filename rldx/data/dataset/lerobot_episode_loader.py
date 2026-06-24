@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 
 from rldx.data.types import ModalityConfig
+from rldx.utils.dist import rank_zero_print as _print
 from rldx.utils.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
 from rldx.utils.video_utils import get_frames_by_indices
 
@@ -144,6 +145,14 @@ class LeRobotEpisodeLoader:
 
         # Set up modality configs after metadata is loaded
         self.modality_configs = self._parse_and_validate_modality_configs(modality_configs)
+        self._logged_language_example = False
+        if "language" in self.modality_configs:
+            lang_key = self.modality_configs["language"].modality_keys[0]
+            if lang_key == "task" and self.tasks_map:
+                first_task = self.tasks_map[min(self.tasks_map.keys())]
+                _print(
+                    f"[i] Dataset language instruction template ({lang_key}): {first_task}"
+                )
 
         # Compute effective episode lengths accounting for action horizon
         self.episode_lengths = self.get_episode_lengths()
@@ -532,6 +541,13 @@ class LeRobotEpisodeLoader:
             if lang_key in LANG_KEYS:
                 new_languages = self.create_language_from_meta(episode_meta, len(df), lang_key)
                 df["language." + lang_key] = new_languages
+                if not self._logged_language_example and len(df) > 0:
+                    logging.info(
+                        "[LeRobotEpisodeLoader] Example language instruction (%s): %s",
+                        lang_key,
+                        df["language." + lang_key].iloc[0],
+                    )
+                    self._logged_language_example = True
 
         # Use actual dataframe length (might be less than nominal)
         actual_length = min(len(df), nominal_length)
