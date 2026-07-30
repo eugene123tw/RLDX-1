@@ -18,7 +18,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 
-__version__ = "0.1.0"
+__version__ = "1.0.1"
 
 _LAZY_ATTRS = {
     "Config": ("rldx.configs.base_config", "Config"),

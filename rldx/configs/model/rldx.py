@@ -41,7 +41,7 @@ class RLDXConfig(PretrainedConfig):
     # model-construction time.
     backbone_model_type: str = "vtc_qwen3_vl"
     model_revision: str | None = None
-    tune_top_llm_layers: int = 0  # Number of top LLM layers to tune
+    tune_top_llm_layers: int = 4  # Number of top LLM layers to tune
     backbone_embedding_dim: int = 4096  # project_to_dim
     tune_llm: bool = False
     tune_visual: bool = False
@@ -60,7 +60,15 @@ class RLDXConfig(PretrainedConfig):
     random_crop_fraction: float | None = None  # None = no-op
     # Step 3 — optional photometric / geometric augmentation (train only)
     random_rotation_angle: int | None = None
-    color_jitter_params: dict[str, float] | None = None
+    # None disables color jitter (no transform added). See rldx/data/augmentations.py.
+    color_jitter_params: dict[str, float] | None = field(
+        default_factory=lambda: {
+            "brightness": 0.3,
+            "contrast": 0.4,
+            "saturation": 0.5,
+            "hue": 0.08,
+        }
+    )
     formalize_language: bool = True
     apply_sincos_state_encoding: bool = (
         False  # Global flag to enable per-embodiment sin/cos encoding
@@ -169,7 +177,7 @@ class RLDXConfig(PretrainedConfig):
     )
 
     # State Augmentation parameters
-    state_dropout_prob: float = 0.0  # State dropout probability
+    state_dropout_prob: float = 0.3  # State dropout probability
     state_additive_noise_scale: float = 0.0  # Scale for additive Gaussian noise on state features
 
     # Real-Time Chunking (RTC). See rldx/model/modules/action_model/rtc.py.

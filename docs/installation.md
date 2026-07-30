@@ -31,7 +31,7 @@ pixi run --environment rldx postinstall
 pixi run --environment rldx python -c "import rldx; print(rldx.__version__)"
 ```
 
-If `import rldx` prints `0.1.0` you are done for training and inference
+If `import rldx` prints the installed rldx version (no import error) you are done for training and inference
 against pre-trained checkpoints. Simulator eval stacks install separately
 (see [Simulator environments](#simulator-environments)).
 
@@ -82,7 +82,7 @@ by every `uv run` call.
 ### Verify
 
 ```bash
-# Python import smoke test — should print "0.1.0"
+# Python import smoke test — should print the installed rldx version (no ImportError)
 uv run python -c "import rldx; print(rldx.__version__)"
 
 # HuggingFace registry smoke test — should print "<class 'rldx.model.core.processing_rldx.RLDXProcessor'>"
@@ -123,7 +123,7 @@ arch target.
 ### Verify (pixi)
 
 ```bash
-# Python import smoke test — should print "0.1.0"
+# Python import smoke test — should print the installed rldx version (no ImportError)
 pixi run --environment rldx python -c "import rldx; print(rldx.__version__)"
 
 # flash-attn was built against the pixi torch and targets sm_120

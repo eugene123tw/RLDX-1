@@ -42,7 +42,6 @@ uv run torchrun --nproc_per_node=8 rldx/experiment/launch_train.py \
     --modality-config-path rldx/configs/data/robocasa_config.py \
     --video-length 4 \
     --n-cog-tokens 64 \
-    --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
     --global-batch-size 64 \
     --learning-rate 1e-4 \
     --max-steps 60000 \
@@ -52,6 +51,10 @@ uv run torchrun --nproc_per_node=8 rldx/experiment/launch_train.py \
     --experiment-name my_run \
     --use-wandb --wandb-project rldx-finetune
 ```
+
+> **Choosing the base checkpoint.** Match `--video-length` to the base:
+> `RLWRLD/RLDX-1-PT` (video input) uses `--video-length 4`, while
+> `RLWRLD/RLDX-1-PT-IMG` (image input) uses `--video-length 1`.
 
 Key fine-tune flags:
 
@@ -167,7 +170,7 @@ geometry. The three knobs are:
 --image-resize-m 32          # alignment multiple
 --random-crop-fraction 0.9   # None (default) = no-op
 --random-rotation-angle 5    # optional train-only rotate
---color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08
+--color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08  # this is the default
 ```
 
 `--random-crop-fraction=None` is the production default — the refactor
@@ -184,7 +187,7 @@ skipped. Set it only when you want extra augmentation.
 | `--learning-rate` | 1e-4 | Warmup via `--warmup-ratio` (default 0.05). |
 | `--lr-scheduler-type` | cosine | |
 | `--weight-decay` | 1e-5 | |
-| `--max-steps` | 10000 | Total training steps. |
+| `--max-steps` | 30000 | Total training steps. |
 | `--save-steps` | 1000 | Checkpoint cadence. |
 | `--save-total-limit` | 5 | Rolling window of saved checkpoints. |
 | `--dataloader-num-workers` | 2 | Workers per rank. |
@@ -204,7 +207,7 @@ head fully tuned.
 | `--tune-projector` | True | Multi-modal projector. |
 | `--tune-diffusion-model` | True | MSAT action model. |
 | `--freeze-cog-tokens` | False | Freeze the learnable cognition-token embeddings. |
-| `--state-dropout-prob` | 0.0 | Stochastic state dropout for regularisation. |
+| `--state-dropout-prob` | 0.3 | Stochastic state dropout for regularisation. |
 | `--general-embodiment-train-ratio` | 0 | Mix-in ratio of general-embodiment (cross-embodiment) samples when fine-tuning on a single embodiment. 0 disables the mix. |
 
 ### LoRA fine-tuning

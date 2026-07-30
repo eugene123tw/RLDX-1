@@ -22,7 +22,6 @@ DATA_DIR="${DATA_DIR:?Set DATA_DIR to the SIMPLER WidowX (bridge_orig) LeRobot d
 
 CKPT_DIR="$BASE_DIR/ckpt/rldx1/finetuned/simpler_widowx/$CKPT_NAME"
 MODALITY_CONFIG_PATH="$BASE_DIR/rldx/configs/data/simpler_widowx_config.py"
-COLOR_JITTER_PARAMS="brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08"
 
 cd "$BASE_DIR"
 export MASTER_PORT=$(shuf -i 20000-30000 -n 1)
@@ -34,7 +33,7 @@ uv run torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
         --dataloader-num-workers 8 \
         --embodiment-tag OXE_BRIDGE_ORIG \
         --modality-config-path "$MODALITY_CONFIG_PATH" \
-        --color-jitter-params $COLOR_JITTER_PARAMS \
+        --state-dropout-prob 0.0 \
         --base-model-path "$BASE_MODEL_PATH" \
         --output-dir "$CKPT_DIR" \
         --num-gpus $NUM_GPUS \
