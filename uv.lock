@@ -478,12 +478,20 @@ wheels = [
 [[package]]
 name = "flash-attn"
 version = "2.7.4.post1"
-source = { registry = "https://pypi.org/simple" }
+source = { path = "wheels/flash_attn-2.7.4.post1-cp310-cp310-linux_x86_64.whl" }
 dependencies = [
     { name = "einops" },
     { name = "torch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/11/34/9bf60e736ed7bbe15055ac2dab48ec67d9dbd088d2b4ae318fd77190ab4e/flash_attn-2.7.4.post1.tar.gz", hash = "sha256:f03485c9a49a4d68d0733acdcad80ab0e72afa025a777fdc2966ceccf9d51765", size = 5986610, upload-time = "2025-01-30T06:39:51.93Z" }
+wheels = [
+    { filename = "flash_attn-2.7.4.post1-cp310-cp310-linux_x86_64.whl", hash = "sha256:090982d66ae5fd014038949e237bc131fab6646388040a17f62c2f79eac917d8" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "einops" },
+    { name = "torch" },
+]
 
 [[package]]
 name = "fonttools"
@@ -1836,7 +1844,7 @@ requires-dist = [
     { name = "dm-tree", specifier = "==0.1.8" },
     { name = "draccus", marker = "extra == 'eval'", specifier = ">=0.8" },
     { name = "einops", specifier = "==0.8.1" },
-    { name = "flash-attn", specifier = "==2.7.4.post1" },
+    { name = "flash-attn", path = "wheels/flash_attn-2.7.4.post1-cp310-cp310-linux_x86_64.whl" },
     { name = "gymnasium", specifier = "==1.2.2" },
     { name = "huggingface-hub", specifier = ">=0.26" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.0" },

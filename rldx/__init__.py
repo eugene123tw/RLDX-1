@@ -63,4 +63,13 @@ if TYPE_CHECKING:
 # import. ``rldx.model.core.rldx`` runs ``AutoConfig.register("RLDX-1", ...)``
 # and ``AutoModel.register(...)``; ``rldx.model.core.processing_rldx`` runs
 # ``AutoProcessor.register(...)``.
-from rldx.model.core import processing_rldx as _processing_rldx, rldx as _rldx  # noqa: E402, F401
+#
+# Guarded so that lightweight consumers (e.g. the simulator rollout client,
+# which installs rldx with ``--no-deps`` and only needs ``EmbodimentTag`` and
+# the eval wrappers) can ``import rldx.*`` without pulling in the full model
+# stack (tyro, albumentations, the VLM backbone, ...). Registration is only
+# needed where a model is actually loaded, which is where those deps exist.
+try:
+    from rldx.model.core import processing_rldx as _processing_rldx, rldx as _rldx  # noqa: E402, F401
+except ImportError:
+    pass

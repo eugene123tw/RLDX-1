@@ -1,17 +1,21 @@
 #!/bin/bash
-# Parallel robocasa eval on 4 GPUs (local, no SLURM).
-# Usage: eval_robocasa.sh <CKPT_NAME>
+# Quick smoke-test version of eval_robocasa.sh: runs only a few episodes per
+# task on 4 GPUs (local, no SLURM). Useful for sanity-checking a checkpoint
+# before kicking off the full 50-episode eval.
+# Usage: eval_robocasa_quick.sh <CKPT_NAME> [N_EPISODES]
 set -u
 export NO_ALBUMENTATIONS_UPDATE=1
 
-CKPT_NAME=${1:?"Usage: $0 <CKPT_NAME>"}
-BASE_DIR="/home/yuchunli/git/RLDX-1"
+CKPT_NAME=${1:?"Usage: $0 <CKPT_NAME> [N_EPISODES]"}
+N_EPISODES=${2:-3}
 MODEL_PATH="$CKPT_NAME"
+BASE_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+UV_ENV="/home/yuchunli/git/RLDX-1/rldx/eval/sim/robocasa/robocasa_uv"
 
-OUT_ROOT="$BASE_DIR/output_final/robocasa/$CKPT_NAME"
-LOG_ROOT="$BASE_DIR/output_final/robocasa/$CKPT_NAME/_launcher_logs"
+OUT_ROOT="$BASE_DIR/output_final/robocasa_quick/$CKPT_NAME"
+LOG_ROOT="$BASE_DIR/output_final/robocasa_quick/$CKPT_NAME/_launcher_logs"
 mkdir -p "$OUT_ROOT" "$LOG_ROOT"
-
+    
 TASK_NAMES=(
   "TurnSinkSpout"  "TurnOnStove"  "TurnOnSinkFaucet"  "TurnOnMicrowave"
   "TurnOffStove"  "TurnOffSinkFaucet"
@@ -22,9 +26,9 @@ TASK_NAMES=(
   "CoffeeSetupMug"  "CoffeeServeMug"  "CoffeePressButton"  "CloseSingleDoor"
   "CloseDrawer"  "CloseDoubleDoor"
 )
-N_GPUS=4
+N_GPUS=2
 TASKS_PER_GPU=6
-BASE_PORT=20100
+BASE_PORT=20200
 
 run_shard() {
   local gpu_id=$1
@@ -57,10 +61,10 @@ run_shard() {
     local task_name=${TASK_NAMES[$i]}
     local out_dir="$OUT_ROOT/$task_name"
     mkdir -p "$out_dir"
-    echo "[shard ${gpu_id}] running ${task_name}" >> "$shard_log"
-    "$BASE_DIR/rldx/eval/sim/robocasa/robocasa_uv/.venv/bin/python" \
+    echo "[shard ${gpu_id}] running ${task_name} (${N_EPISODES} episodes)" >> "$shard_log"
+    "$UV_ENV/.venv/bin/python" \
       "$BASE_DIR/rldx/eval/rollout_policy.py" \
-        --n_episodes 50 \
+        --n_episodes "$N_EPISODES" \
         --policy_client_host 127.0.0.1 \
         --policy_client_port "$port" \
         --max_episode_steps 720 \
@@ -86,4 +90,4 @@ for pid in "${SHARD_PIDS[@]}"; do
   wait "$pid"
 done
 
-echo "[launcher] All shards complete"
+echo "[launcher] All shards complete (quick run, ${N_EPISODES} episodes/task)"
