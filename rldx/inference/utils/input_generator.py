@@ -40,11 +40,20 @@ def generate_synthetic_input(
         custom_prompt: Explicit text prompt string. If None,
             ``_DEFAULT_VLA_PROMPT`` is used.
     """
+    from pathlib import Path
+
+    from huggingface_hub import snapshot_download
     from PIL import Image
     from transformers import AutoProcessor
 
     torch.manual_seed(seed)
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    # RLDX-1 checkpoints store processor files under a `processor/` subfolder
+    # (see rldx/policy/policy_loader.py::_load_processor). Resolve to a local
+    # dir first so the subfolder check works for Hub repo ids too.
+    local_dir = Path(model_path) if Path(model_path).is_dir() else Path(snapshot_download(model_path))
+    processor_subdir = local_dir / "processor"
+    processor_path = processor_subdir if processor_subdir.exists() else local_dir
+    processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
     # ``RLDXProcessor`` wraps an inner Qwen3-VL processor on
     # ``self.processor``.  The inference benchmarks just need the raw
     # tokenizer / image-processor surface (``apply_chat_template`` +
