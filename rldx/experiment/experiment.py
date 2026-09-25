@@ -109,6 +109,22 @@ def run(config: Config):
         local_rank = 0
         global_rank = 0
 
+    # When not using distributed training, restrict CUDA_VISIBLE_DEVICES to
+    # num_gpus so that HF Trainer does not silently wrap the model in
+    # DataParallel across more GPUs than requested.  DataParallel replication
+    # breaks RLDX.device (and HF PreTrainedModel replicas in general) because
+    # _replicate_for_data_parallel empties _parameters on each replica.
+    if not dist.is_initialized() and "CUDA_VISIBLE_DEVICES" not in os.environ:
+        n_requested = config.training.num_gpus
+        n_available = torch.cuda.device_count()
+        if n_requested < n_available:
+            visible = ",".join(str(i) for i in range(n_requested))
+            os.environ["CUDA_VISIBLE_DEVICES"] = visible
+            _print(
+                f"[i] Restricting CUDA_VISIBLE_DEVICES to {visible!r} "
+                f"(num_gpus={n_requested}, available={n_available})"
+            )
+
     # Setup
     setup_logging()
     set_seed(config.data.seed)

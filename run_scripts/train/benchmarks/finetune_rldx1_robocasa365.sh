@@ -45,7 +45,6 @@ MASTER_ADDR_FILE="$RLDX_LOG_DIR/master_addr_${SLURM_JOB_ID:-$$}.txt"
 
 CKPT_DIR="$BASE_DIR/ckpt/rldx1/finetuned/$CKPT_NAME"
 MODALITY_CONFIG_PATH="$BASE_DIR/rldx/configs/data/robocasa365_config.py"
-COLOR_JITTER_PARAMS="brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08"
 
 # Discover all lerobot datasets under DATA_ROOT (exclude mimicgen-synth)
 mapfile -t DATASETS < <(python3 -c "
@@ -93,7 +92,7 @@ uv run torchrun \
         --dataloader-num-workers 20 \
         --embodiment-tag GENERAL_EMBODIMENT \
         --modality-config-path "$MODALITY_CONFIG_PATH" \
-        --color-jitter-params $COLOR_JITTER_PARAMS \
+        --state-dropout-prob 0.0 \
         --base-model-path "$BASE_MODEL_PATH" \
         --output-dir "$CKPT_DIR" \
         --num-gpus "$TOTAL_GPUS" \

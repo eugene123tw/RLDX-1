@@ -1,6 +1,7 @@
 #!/bin/bash
 # Local (non-slurm) LIBERO evaluation runner.
-# Usage: eval_libero.sh <CKPT_NAME> <MODEL_PATH> [GPU_ID] [MAX_PARALLEL]
+# Usage: eval_libero.sh <CKPT_NAME> <MODEL_PATH> [GPU_ID] [MAX_PARALLEL] [COMPILE_LEVEL]
+# COMPILE_LEVEL: none (default, eager) | submodule (Path B) | fullgraph (Path D, CUDA graph + Triton chain)
 set -u
 
 export NO_ALBUMENTATIONS_UPDATE=1
@@ -9,6 +10,7 @@ CKPT_NAME="${1:?CKPT_NAME required}"
 MODEL_PATH="${2:?MODEL_PATH required}"
 GPU_ID="${3:-0}"
 MAX_PARALLEL="${4:-4}"
+COMPILE_LEVEL="${5:-none}"
 
 BASE_DIR="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 LIBERO_PY="$BASE_DIR/rldx/eval/sim/LIBERO/libero_uv/.venv/bin/python"
@@ -25,14 +27,20 @@ PORT=$(find_free_port $((20000 + RANDOM % 40000)))
 
 echo "[i] CKPT_NAME=$CKPT_NAME"
 echo "[i] MODEL_PATH=$MODEL_PATH"
-echo "[i] GPU_ID=$GPU_ID  MAX_PARALLEL=$MAX_PARALLEL  PORT=$PORT"
+echo "[i] GPU_ID=$GPU_ID  MAX_PARALLEL=$MAX_PARALLEL  PORT=$PORT  COMPILE_LEVEL=$COMPILE_LEVEL"
 
 cd "$BASE_DIR"
+
+COMPILE_ARGS=()
+if [ "$COMPILE_LEVEL" != "none" ]; then
+  COMPILE_ARGS=(--compile "$COMPILE_LEVEL")
+fi
 CUDA_VISIBLE_DEVICES=$GPU_ID uv run python rldx/eval/run_rldx_server.py \
     --model-path "$MODEL_PATH" \
     --embodiment-tag GENERAL_EMBODIMENT \
     --use-sim-policy-wrapper \
     --no-strict \
+    "${COMPILE_ARGS[@]}" \
     --host 127.0.0.1 \
     --port "$PORT" &
 SERVE_PID=$!

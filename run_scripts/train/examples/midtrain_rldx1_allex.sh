@@ -24,7 +24,6 @@ DATA_MIX="rldx1_midtrain_allex"
 
 CKPT_DIR="$BASE_DIR/ckpt/rldx1/finetuned/$CKPT_NAME"
 MODALITY_CONFIG_PATH="$BASE_DIR/rldx/configs/data/midtrain_allex_data_config.py"
-COLOR_JITTER_PARAMS="brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08"
 
 # ── Component configs ─────────────────────────────────────
 VIDEO_CONFIGS="\
@@ -70,7 +69,7 @@ srun uv run torchrun --nproc_per_node=$NUM_GPUS --nnodes=$NUM_NODES \
         --pt-dataset-mix $DATA_MIX \
         --dataloader-num-workers 8 \
         --modality-config-path $MODALITY_CONFIG_PATH \
-        --color-jitter-params $COLOR_JITTER_PARAMS \
+        --state-dropout-prob 0.0 \
         --base-model-path $BASE_MODEL_PATH \
         --output-dir $CKPT_DIR \
         --num-gpus $NUM_GPUS \

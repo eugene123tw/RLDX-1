@@ -2,13 +2,13 @@
 
 # RLDX-1
 
-[[Paper]](https://arxiv.org/abs/2605.03269) [[Project Page]](https://rlwrld.ai/rldx-1) [[Models]](https://huggingface.co/collections/RLWRLD/rldx-1)
+[![arXiv](https://img.shields.io/badge/arXiv-2605.03269-b31b1b.svg)](https://arxiv.org/abs/2605.03269)
+[![Project Page](https://img.shields.io/badge/Project-Page-1f72b1.svg)](https://rlwrld.ai/rldx-1)
+[![Models](https://img.shields.io/badge/Models-HuggingFace-yellow.svg)](https://huggingface.co/collections/RLWRLD/rldx-1)
 
 <img src="assets/rldx_overview.png" width="100%" alt="RLDX-1 overview">
 
 </div>
-
----
 
 RLDX-1 is a Vision-Language-Action model (VLA) for human-like
 dexterous manipulation. Beyond the *versatile intelligence* inherited
@@ -18,13 +18,18 @@ sensing — through a unified **Multi-Stream Action Transformer (MSAT)**
 architecture, a synthetic-augmented training pipeline, and a real-time
 inference stack.
 
----
+
+## News
+
+- **[2026.06.16]** RLDX-1-PT-**IMG** (lightweight image-input version) released!
+- **[2026.05.06]** Technical report, blog post, codes and model checkpoints for RLDX-1 released!
+
+
+## Highlights
 
 <div align="center">
 <img src="assets/overview_architecture.png" width="90%" alt="RLDX-1 architecture">
 </div>
-
-## Highlights
 
 - **Multi-Stream Action Transformer (MSAT).** Cognition, physics, and
   action each get a dedicated stream coupled by joint self-attention —
@@ -45,8 +50,6 @@ inference stack.
   bring the all-modality model to **43.7 ms / step on RTX 5090
   (1.63× speedup, >22 Hz)**.
 
----
-
 ## Performance
 
 ### Simulation Benchmarks
@@ -61,6 +64,7 @@ compared to recent frontier VLA baselines.
 | π0.5    | 96.9 | 86.5 | 72.7 | 68.4 | 46.9 | 62.1 | 15.4 | 16.9 |
 | GR00T N1.5 | 86.5 | 66.3 | 52.4 | 43.7 | 62.0 | 65.7 | 48.0 | 20.0 |
 | GR00T N1.6 | 96.7 | 72.6 | 76.1 | 57.1 | 57.1 | 66.2 | 47.6 | 26.9 |
+| **RLDX-1-IMG (ours)** | 94.5 | - | - | - | - | 67.8 | 54.3 | - |
 | **RLDX-1 (ours)** | **97.8** | **86.7** | **81.5** | **77.4** | **71.9** | **70.6** | **58.7** | **32.1** |
 
 The first five columns cover the established LIBERO / SIMPLER family;
@@ -68,8 +72,6 @@ the last three (RoboCasa Kitchen, GR-1 Tabletop, RoboCasa365) are
 long-horizon, humanoid, and compositional benchmarks. Per-benchmark
 checkpoints, embodiment tags, and reproduce commands are listed under
 [Reproducing Benchmark Results](#reproducing-benchmark-results).
-
----
 
 ## Installation
 
@@ -90,8 +92,6 @@ uv run python -c "import rldx; print(rldx.__version__)"
 For simulator setup, dev tooling, and full troubleshooting, see
 [`docs/installation.md`](docs/installation.md).
 
----
-
 ## Documentation
 
 Hands-on guides live under [`docs/`](docs/):
@@ -105,18 +105,14 @@ Hands-on guides live under [`docs/`](docs/):
 | [`evaluation.md`](docs/evaluation.md) | RoboCasa / LIBERO / SIMPLER / GR-1 eval, server + rollout split, results aggregation |
 | [`inference_server.md`](docs/inference_server.md) | `run_rldx_server.py` CLI, wire protocol, RTC modes, `--compile` levels, simulator + real-robot deployment |
 
-
----
-
 ## Pretrained & Midtrained Checkpoints
 
 | Checkpoint | Description | Params | HuggingFace |
 |-----------|-------------|--------|-------------|
-| `RLDX-1-PT` | Pre-trained (video) | 6.9B | [RLWRLD/RLDX-1-PT](https://huggingface.co/RLWRLD/RLDX-1-PT) |
+| `RLDX-1-PT` | Pre-trained (video input) | 6.9B | [RLWRLD/RLDX-1-PT](https://huggingface.co/RLWRLD/RLDX-1-PT) |
+| `RLDX-1-PT-IMG` | Pre-trained (image input) | 6.9B | [RLWRLD/RLDX-1-PT-IMG](https://huggingface.co/RLWRLD/RLDX-1-PT-IMG) |
 | `RLDX-1-MT-DROID` | Mid-trained on DROID with all add-ons | 8.1B | [RLWRLD/RLDX-1-MT-DROID](https://huggingface.co/RLWRLD/RLDX-1-MT-DROID) |
 | `RLDX-1-MT-ALLEX` | Mid-trained on ALLEX with all add-ons | 8.1B | [RLWRLD/RLDX-1-MT-ALLEX](https://huggingface.co/RLWRLD/RLDX-1-MT-ALLEX) |
-
----
 
 ## Data Preparation
 
@@ -159,8 +155,6 @@ together with an `EmbodimentTag` that selects the per-robot MLP head slot
 
 The `EmbodimentTag` design and per-embodiment MLP head structure follow
 the convention introduced by [NVIDIA GR00T N1.7](https://github.com/NVIDIA/Isaac-GR00T/tree/n1.7-release).
-
----
 
 ## Fine-tuning
 
@@ -264,8 +258,6 @@ counterpart is
 and [`docs/inference_server.md`](docs/inference_server.md#real-time-chunking-rtc)
 for usage details.
 
----
-
 ## Inference
 
 RLDX-1 ships two inference paths sharing the same model + processor:
@@ -333,8 +325,6 @@ The full flag list, the `compile × RTC` compatibility matrix, and a
 walkthrough of the trade-offs are in
 [`docs/inference_server.md`](docs/inference_server.md#real-time-chunking-rtc).
 
----
-
 ## Reproducing Benchmark Results
 
 Each benchmark has a self-contained eval README; this table maps each
@@ -354,8 +344,6 @@ runnable guide.
 
 Shared mechanics (server + rollout split, common flags, troubleshooting)
 are documented in [`docs/evaluation.md`](docs/evaluation.md).
-
----
 
 ## Project Structure
 
@@ -380,8 +368,6 @@ rldx/
 └── utils/                                # Distributed training utilities
 ```
 
----
-
 ## Citation
 
 ```bibtex
@@ -394,8 +380,6 @@ rldx/
   archivePrefix={arXiv}
 }
 ```
-
----
 
 ## Acknowledgments
 

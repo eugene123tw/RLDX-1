@@ -16,7 +16,7 @@
 # This file has been modified from the original NVIDIA Isaac GR00T N1.7.
 # Original source: https://github.com/NVIDIA/Isaac-GR00T
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from rldx.data.embodiment_tags import EmbodimentTag
 
@@ -326,18 +326,22 @@ class TrainConfig:
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""
 
-    color_jitter_params: dict[str, float] | None = None
+    color_jitter_params: dict[str, float] | None = field(
+        default_factory=lambda: {
+            "brightness": 0.3,
+            "contrast": 0.4,
+            "saturation": 0.5,
+            "hue": 0.08,
+        }
+    )
     """
     Parameters for color jitter augmentation on images.
 
-    Expected keys include:
-      - "brightness": float
-      - "contrast": float
-      - "saturation": float
-      - "hue": float
-    Example: {"brightness": 0.4, "contrast": 0.4, "saturation": 0.4, "hue": 0.1}
+    Expected keys: "brightness", "contrast", "saturation", "hue" (all float).
 
-    If None, applying the default color jitter augmentation from the pretrained model.
+    When a dict is given, an ``A.ColorJitter`` transform is added to the train
+    pipeline (see ``rldx/data/augmentations.py``); missing keys default to 0.0.
+    Set to None to disable color jitter entirely (no transform is added).
     """
     # ----------------------------------------------------------------------------------------------
 
@@ -391,7 +395,7 @@ class TrainConfig:
     wandb_project: str = "RLDX-1"
     """Weights & Biases project name."""
 
-    max_steps: int = 10000
+    max_steps: int = 30000
     """Total number of training steps to run before stopping."""
 
     new_param_warmup_steps: int = 0
