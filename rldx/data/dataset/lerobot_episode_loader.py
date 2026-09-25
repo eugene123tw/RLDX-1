@@ -47,7 +47,7 @@ import pandas as pd
 from rldx.data.types import ModalityConfig
 from rldx.utils.dist import rank_zero_print as _print
 from rldx.utils.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
-from rldx.utils.video_utils import get_frames_by_indices
+from rldx.utils.video_utils import get_frames_by_indices, get_frames_by_timestamps
 
 
 # LeRobot standard metadata filenames
@@ -175,16 +175,24 @@ class LeRobotEpisodeLoader:
         with open(info_path, "r") as f:
             self.info_meta = json.load(f)
 
-        # Load episode metadata (one episode per line)
-        episodes_path = meta_dir / LEROBOT_EPISODES_FILENAME
-        with open(episodes_path, "r") as f:
-            self.episodes_metadata = [json.loads(line) for line in f]
+        # LeRobot v3.0 packs many episodes into shared chunk files and stores
+        # episode/task metadata as parquet instead of the v2.1 per-episode
+        # parquet + jsonl layout, so it needs a different loading path.
+        self.is_v3 = str(self.info_meta.get("codebase_version", "v2.1")).startswith("v3")
 
-        # Load task descriptions and create mapping
-        tasks_path = meta_dir / LEROBOT_TASKS_FILENAME
-        with open(tasks_path, "r") as f:
-            tasks_data = [json.loads(line) for line in f]
-            self.tasks_map = {task["task_index"]: task["task"] for task in tasks_data}
+        if self.is_v3:
+            self._load_v3_metadata()
+        else:
+            # Load episode metadata (one episode per line)
+            episodes_path = meta_dir / LEROBOT_EPISODES_FILENAME
+            with open(episodes_path, "r") as f:
+                self.episodes_metadata = [json.loads(line) for line in f]
+
+            # Load task descriptions and create mapping
+            tasks_path = meta_dir / LEROBOT_TASKS_FILENAME
+            with open(tasks_path, "r") as f:
+                tasks_data = [json.loads(line) for line in f]
+                self.tasks_map = {task["task_index"]: task["task"] for task in tasks_data}
 
         # Load modality structure information
         modality_path = meta_dir / LEROBOT_MODALITY_FILENAME
@@ -210,6 +218,101 @@ class LeRobotEpisodeLoader:
         self.video_path_pattern = self.info_meta.get("video_path")
         self.chunk_size = self.info_meta["chunks_size"]
         self.fps = self.info_meta.get("fps", 30)
+
+    def _load_v3_metadata(self) -> None:
+        """
+        Load episode/task metadata for a LeRobot v3.0 dataset via the ``lerobot`` package.
+
+        Populates ``self.episodes_metadata`` and ``self.tasks_map`` in the same shape the
+        v2.1 path produces, plus v3-only caches (``_v3_hf_dataset``, ``_lerobot_meta``,
+        per-episode row ranges and video ``from_timestamp`` offsets) used to slice the
+        shared chunk parquet/video files at load time.
+        """
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        except ImportError as e:
+            raise RuntimeError(
+                f"Dataset {self.dataset_path} is LeRobot v3.0 (codebase_version="
+                f"{self.info_meta.get('codebase_version')!r}), which needs the 'lerobot' "
+                "package to read. Install it in this environment, or convert the dataset "
+                "to v2.1 with run_scripts/data/convert_lerobot_v3_to_v2.py."
+            ) from e
+
+        # lerobot uses a different set of decoder backend names than rldx's video utils.
+        lerobot_backend = (
+            self.video_backend if self.video_backend in ("torchcodec", "pyav", "video_reader") else "pyav"
+        )
+        ds = LeRobotDataset(
+            repo_id=self.dataset_path.name,
+            root=self.dataset_path,
+            download_videos=False,
+            video_backend=lerobot_backend,
+        )
+        lmeta = ds.meta
+        self._lerobot_meta = lmeta
+        self._v3_hf_dataset = ds.hf_dataset.with_format(None)
+        self._v3_video_keys = list(lmeta.video_keys)
+
+        self.episodes_metadata = []
+        for ep_idx in range(lmeta.total_episodes):
+            ep = lmeta.episodes[ep_idx]
+            start, end = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
+            self.episodes_metadata.append(
+                {
+                    "episode_index": ep_idx,
+                    "length": end - start,
+                    "tasks": list(ep["tasks"]),
+                    "_v3_from": start,
+                    "_v3_to": end,
+                    "_v3_video_from_ts": {
+                        vk: float(ep[f"videos/{vk}/from_timestamp"]) for vk in self._v3_video_keys
+                    },
+                }
+            )
+
+        self.tasks_map = {int(row["task_index"]): task for task, row in lmeta.tasks.iterrows()}
+
+    def _load_v3_episode_df(self, episode_index: int) -> pd.DataFrame:
+        """Slice one episode's rows out of the shared v3.0 chunk parquet as a DataFrame."""
+        ep = self.episodes_metadata[episode_index]
+        sl = self._v3_hf_dataset.select(range(ep["_v3_from"], ep["_v3_to"]))
+        df = sl.to_pandas()
+        # Match pd.read_parquet: sequence features must be np.ndarray so downstream
+        # slicing (_extract_joint_groups) treats them as arrays, not scalars.
+        for col in df.columns:
+            if len(df) and isinstance(df[col].iloc[0], list):
+                df[col] = df[col].map(np.asarray)
+        return df
+
+    def _load_v3_video_data(
+        self, episode_index: int, indices: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        """Decode this episode's frames from the concatenated v3.0 per-chunk videos."""
+        video_data = {}
+        ep = self.episodes_metadata[episode_index]
+        sl = self._v3_hf_dataset.select(range(ep["_v3_from"], ep["_v3_to"]))
+        rel_ts = np.asarray(sl["timestamp"], dtype=np.float64)[indices]
+
+        for image_key in self.modality_configs["video"].modality_keys:
+            original_key = self.modality_meta["video"][image_key].get(
+                "original_key", f"observation.images.{image_key}"
+            )
+            assert original_key in self.feature_config, (
+                f"Original key {original_key} not found in feature config"
+            )
+            # v3 concatenates episodes into one mp4; offset into this episode's clip.
+            from_ts = ep["_v3_video_from_ts"][original_key]
+            abs_ts = (rel_ts + from_ts).tolist()
+            video_path = self.dataset_path / self._lerobot_meta.get_video_file_path(
+                episode_index, original_key
+            )
+            video_data[image_key] = get_frames_by_timestamps(
+                str(video_path),
+                abs_ts,
+                video_backend=self.video_backend,
+                video_backend_kwargs=self.video_backend_kwargs or {},
+            )
+        return video_data
 
     def get_episode_lengths(self):
         """
@@ -334,13 +437,16 @@ class LeRobotEpisodeLoader:
         Returns:
             Processed DataFrame with all modality data
         """
-        # Load raw parquet data using chunking pattern
-        chunk_idx = episode_index // self.chunk_size
-        parquet_filename = self.data_path_pattern.format(
-            episode_chunk=chunk_idx, episode_index=episode_index
-        )
-        parquet_path = self.dataset_path / parquet_filename
-        original_df = pd.read_parquet(parquet_path)
+        # Load raw episode dataframe (v2.1 per-episode parquet or v3.0 chunked slice)
+        if self.is_v3:
+            original_df = self._load_v3_episode_df(episode_index)
+        else:
+            chunk_idx = episode_index // self.chunk_size
+            parquet_filename = self.data_path_pattern.format(
+                episode_chunk=chunk_idx, episode_index=episode_index
+            )
+            parquet_path = self.dataset_path / parquet_filename
+            original_df = pd.read_parquet(parquet_path)
         loaded_df = pd.DataFrame()
 
         # Process language annotations (convert task indices to task strings)
@@ -399,6 +505,9 @@ class LeRobotEpisodeLoader:
 
         if not self.video_path_pattern or "video" not in self.modality_configs:
             return video_data
+
+        if self.is_v3:
+            return self._load_v3_video_data(episode_index, indices)
 
         chunk_idx = episode_index // self.chunk_size
         image_keys = self.modality_configs["video"].modality_keys

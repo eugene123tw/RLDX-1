@@ -178,6 +178,7 @@ def _apply_cli_model_overrides(
     # cast in ``_apply_backbone_lora`` since PEFT inherits fp32 from the
     # (already-promoted) base layer.
     run_config.model.tune_top_llm_layers = 0 if cli.backbone_use_lora else cli.tune_top_llm_layers
+    run_config.model.backbone_trainable_params_fp32 = cli.backbone_trainable_params_fp32
     run_config.model.freeze_cog_tokens = cli.freeze_cog_tokens
     run_config.model.general_embodiment_train_ratio = cli.general_embodiment_train_ratio
     run_config.model.conversation_image_first = cli.conversation_image_first

@@ -171,6 +171,10 @@ class TrainConfig:
     tune_top_llm_layers: int = 4
     """Number of top LLM layers to tune."""
 
+    backbone_trainable_params_fp32: bool = True
+    """If True, keep trainable backbone params in fp32 (higher memory). Pass
+    ``--no-backbone-trainable-params-fp32`` to keep them in bf16 and save memory."""
+
     state_dropout_prob: float = 0.0
     """Dropout probability applied to state inputs for regularization during training."""
 
