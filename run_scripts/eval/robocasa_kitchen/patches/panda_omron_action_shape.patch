@@ -1,0 +1,51 @@
+Make PandaOmronKeyConverter.unmap_action tolerant of the action shapes our
+policy actually emits.
+
+Upstream indexes ``action.base_motion[..., 3:4]`` unconditionally and compares
+``action.gripper_close`` / ``action.control_mode`` as bare scalars. Our policy
+emits a 3-wide base_motion for embodiments without a torso DoF, and emits the
+two mode flags as 1-element arrays, so upstream raises on the torso slice and
+compares an array where a float is expected. Guard the slice and normalise the
+flags through np.atleast_1d, returning np.array values so the dict stays
+uniformly array-valued for the downstream robosuite call.
+
+The sibling PandaPandaKeyConverter.unmap_action is deliberately left alone --
+it is not reached by our eval paths and keeping it untouched keeps this patch
+minimal against upstream.
+
+diff --git a/robocasa/models/robots/__init__.py b/robocasa/models/robots/__init__.py
+index 438ed7ea..2ed20ef7 100644
+--- a/robocasa/models/robots/__init__.py
++++ b/robocasa/models/robots/__init__.py
+@@ -473,10 +473,11 @@
+     @classmethod
+     def unmap_action(cls, input_action):
+         output_action = type(input_action)()
++        base_motion = input_action["action.base_motion"]
+         output_action = {
+-            "robot0_right_gripper": -1.0
+-            if input_action["action.gripper_close"] < 0.5
+-            else 1.0,
++            "robot0_right_gripper": np.array([-1.0])
++            if np.atleast_1d(input_action["action.gripper_close"])[0] < 0.5
++            else np.array([1.0]),
+             "robot0_right": np.concatenate(
+                 (
+                     input_action["action.end_effector_position"],
+@@ -484,11 +485,11 @@
+                 ),
+                 axis=-1,
+             ),
+-            "robot0_base": input_action["action.base_motion"][..., 0:3],
+-            "robot0_torso": input_action["action.base_motion"][..., 3:4],
+-            "robot0_base_mode": -1.0
+-            if input_action["action.control_mode"] < 0.5
+-            else 1.0,
++            "robot0_base": base_motion[..., 0:3],
++            "robot0_torso": base_motion[..., 3:4] if base_motion.shape[-1] >= 4 else np.array([0.0]),
++            "robot0_base_mode": np.array([-1.0])
++            if np.atleast_1d(input_action["action.control_mode"])[0] < 0.5
++            else np.array([1.0]),
+         }
+         return output_action
+ 

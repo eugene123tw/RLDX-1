@@ -1,29 +1,8 @@
+from rldx import plugins
 from rldx.data.embodiment_tags import EmbodimentTag
 
 
 dataset_mix = {
-    "calvin": [
-        {
-            "dataset_name": "calvin_task_ABC_D_lerobot_0_4",
-            "mix_ratio": 1.0,
-            "embodiment_tag": EmbodimentTag.GENERAL_EMBODIMENT,
-        },
-        {
-            "dataset_name": "calvin_task_ABC_D_lerobot_1_4",
-            "mix_ratio": 1.0,
-            "embodiment_tag": EmbodimentTag.GENERAL_EMBODIMENT,
-        },
-        {
-            "dataset_name": "calvin_task_ABC_D_lerobot_2_4",
-            "mix_ratio": 1.0,
-            "embodiment_tag": EmbodimentTag.GENERAL_EMBODIMENT,
-        },
-        {
-            "dataset_name": "calvin_task_ABC_D_lerobot_3_4",
-            "mix_ratio": 1.0,
-            "embodiment_tag": EmbodimentTag.GENERAL_EMBODIMENT,
-        },
-    ],
     "rldx1_midtrain_allex": [
         {
             "dataset_name": "real_allex",
@@ -181,3 +160,7 @@ dataset_mix = {
         },
     ],
 }
+
+
+for _plugin in plugins.modules("mixes"):
+    _plugin.register(dataset_mix)

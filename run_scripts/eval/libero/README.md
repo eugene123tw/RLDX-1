@@ -6,9 +6,9 @@ gripper (40 tasks across Spatial / Object / Goal / Long suites).
 | Field | Value |
 |---|---|
 | Embodiment tag | `GENERAL_EMBODIMENT` |
-| HuggingFace checkpoint | [`RLWRLD/RLDX-1-FT-LIBERO`](https://huggingface.co/RLWRLD/RLDX-1-FT-LIBERO) |
-| Reported success rate | 97.4 % (LIBERO Avg) / 84.3 % (LIBERO-Plus) |
-| Simulator venv | `rldx/eval/sim/LIBERO/libero_uv/.venv` |
+| HuggingFace checkpoint | [`RLWRLD/RLDX-1.1-FT-LIBERO`](https://huggingface.co/RLWRLD/RLDX-1.1-FT-LIBERO) |
+| Reported success rate | 97.9 % (LIBERO Avg) |
+| Simulator venv | `run_scripts/eval/libero/libero_uv/.venv` |
 
 ## 1. Setup (one-time)
 
@@ -16,16 +16,17 @@ gripper (40 tasks across Spatial / Object / Goal / Long suites).
 bash run_scripts/eval/libero/setup_libero.sh
 ```
 
-Builds an isolated `uv` venv for LIBERO and downloads task assets.
+Builds an isolated `uv` venv for LIBERO. The task assets ship in the LIBERO
+submodule, so nothing is downloaded.
 
-## 2. Fine-tune from RLDX-1-PT
+## 2. Fine-tune from RLDX-1.1-PT
 
 ```bash
 DATA_DIR=/path/to/libero_delta \
-bash run_scripts/train/benchmarks/finetune_rldx1_libero.sh
+bash run_scripts/train/benchmarks/finetune_libero.sh
 ```
 
-Defaults to `RLWRLD/RLDX-1-PT` as the base; override with
+Defaults to `RLWRLD/RLDX-1.1-PT` as the base; override with
 `BASE_MODEL_PATH=...`.
 
 ## 3. Run evaluation
@@ -33,7 +34,7 @@ Defaults to `RLWRLD/RLDX-1-PT` as the base; override with
 ```bash
 bash run_scripts/eval/libero/eval_libero.sh \
     libero_release \
-    RLWRLD/RLDX-1-FT-LIBERO
+    RLWRLD/RLDX-1.1-FT-LIBERO
 ```
 
 Arguments: `<run_label>` (output dir name), `<MODEL_PATH>` (HF repo or

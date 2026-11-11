@@ -29,7 +29,10 @@ Args:
     embodiment_tag: Embodiment tag to use to load modality configurations from `rldx/configs/data/embodiment_configs.py`.
 """
 
+import contextlib
+import fcntl
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -41,13 +44,24 @@ from rldx.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
 from rldx.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
 from rldx.data.state_action.pose import EndEffectorPose, JointPose
 from rldx.data.types import ActionRepresentation, ActionType, EmbodimentTag, ModalityConfig
-from rldx.data.utils import to_json_serializable
+from rldx.data.utils import to_json_serializable, write_json_atomic
 
 
 LE_ROBOT_DATA_FILENAME = "data/*/*.parquet"
 LE_ROBOT_INFO_FILENAME = "meta/info.json"
 LE_ROBOT_STATS_FILENAME = "meta/stats.json"
 LE_ROBOT_REL_STATS_FILENAME = "meta/relative_stats.json"
+
+REQUIRED_STATS = ("mean", "std", "min", "max", "q01", "q99")
+
+
+def _has_required_relative_stats(entry: object) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for stat in REQUIRED_STATS:
+        if stat not in entry:
+            return False
+    return True
 
 
 def calculate_dataset_statistics(
@@ -96,7 +110,36 @@ def calculate_dataset_statistics(
     return dataset_statistics
 
 
+@contextlib.contextmanager
+def _dataset_lock(dataset_path: Path):
+    """Serialise stats writes for one dataset across processes and nodes.
+
+    Yields False when the lock cannot be taken; the caller still does the work.
+    """
+    lock_path = dataset_path / "meta" / ".stats.lock"
+    fd = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        locked = True
+    except OSError as exc:
+        print(f"[warn] could not lock {lock_path} ({exc}); proceeding unserialised")
+        locked = False
+
+    try:
+        yield locked
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+
 def check_stats_validity(dataset_path: Path | str, features: list[str]):
+    """Whether ``dataset_path`` already holds the statistics a run will read."""
     stats_path = Path(dataset_path) / LE_ROBOT_STATS_FILENAME
     if not stats_path.exists():
         return False
@@ -107,53 +150,77 @@ def check_stats_validity(dataset_path: Path | str, features: list[str]):
             return False
         if not isinstance(stats[feature], dict):
             return False
-        for stat in ["mean", "std", "min", "max", "q01", "q99"]:
+        for stat in REQUIRED_STATS:
             if stat not in stats[feature]:
                 return False
     return True
 
 
 def generate_stats(dataset_path: Path | str):
+    """Fill in missing statistics, keeping every entry this cannot recompute.
+
+    Only float features can be summarised here, so this merges rather than
+    replaces: overwriting would drop the entries it cannot produce.
+    """
     dataset_path = Path(dataset_path)
-    print(f"Generating stats for {str(dataset_path)}")
     lowdim_features = []
     with open(dataset_path / LE_ROBOT_INFO_FILENAME, "r") as f:
         le_features = json.load(f)["features"]
     for feature in le_features:
         if "observation.velocity" in feature:  # NOTE(TY):SKIP VELOCITY for ALLEX
             continue
+        # A zero in the declared shape is a placeholder; its rows do not stack
+        # into an array and `calculate_dataset_statistics` would raise.
+        if 0 in (le_features[feature].get("shape") or []):
+            continue
         if "float" in le_features[feature]["dtype"]:
             lowdim_features.append(feature)
     if check_stats_validity(dataset_path, lowdim_features):
         return
 
-    parquet_files = list(dataset_path.glob(LE_ROBOT_DATA_FILENAME))
-    stats = calculate_dataset_statistics(parquet_files, lowdim_features)
-    stats_path = dataset_path / LE_ROBOT_STATS_FILENAME
-    with open(stats_path, "w") as f:
-        json.dump(stats, f, indent=4)
+    with _dataset_lock(dataset_path):
+        # Re-check now that we hold the lock: another job may have just done it,
+        # and repeating the parquet pass would only risk racing its result.
+        if check_stats_validity(dataset_path, lowdim_features):
+            return
+
+        print(f"Generating stats for {str(dataset_path)}")
+        parquet_files = list(dataset_path.glob(LE_ROBOT_DATA_FILENAME))
+        computed = calculate_dataset_statistics(parquet_files, lowdim_features)
+
+        stats_path = dataset_path / LE_ROBOT_STATS_FILENAME
+        stats = {}
+        if stats_path.exists():
+            with open(stats_path, "r") as f:
+                stats = json.load(f)
+        stats.update(computed)
+        write_json_atomic(stats_path, stats)
 
 
 class RelativeActionLoader:
-    def __init__(self, dataset_path: Path | str, embodiment_tag: EmbodimentTag, action_key: str):
+    def __init__(
+        self,
+        dataset_path: Path | str,
+        modality_configs: dict[str, ModalityConfig],
+        action_key: str,
+    ):
         self.dataset_path = Path(dataset_path)
         self.modality_configs: dict[str, ModalityConfig] = {}
         self.action_key = action_key
+        action, state = modality_configs["action"], modality_configs["state"]
         # Check action config
-        assert action_key in MODALITY_CONFIGS[embodiment_tag.value]["action"].modality_keys
-        idx = MODALITY_CONFIGS[embodiment_tag.value]["action"].modality_keys.index(action_key)
-        action_configs = MODALITY_CONFIGS[embodiment_tag.value]["action"].action_configs
-        assert action_configs is not None, MODALITY_CONFIGS[embodiment_tag.value]["action"]
-        self.action_config = action_configs[idx]
+        assert action_key in action.modality_keys
+        assert action.action_configs is not None, action
+        self.action_config = action.action_configs[action.modality_keys.index(action_key)]
         self.modality_configs["action"] = ModalityConfig(
-            delta_indices=MODALITY_CONFIGS[embodiment_tag.value]["action"].delta_indices,
+            delta_indices=action.delta_indices,
             modality_keys=[action_key],
         )
         # Check state config
         state_key = self.action_config.state_key or action_key
-        assert state_key in MODALITY_CONFIGS[embodiment_tag.value]["state"].modality_keys
+        assert state_key in state.modality_keys
         self.modality_configs["state"] = ModalityConfig(
-            delta_indices=MODALITY_CONFIGS[embodiment_tag.value]["state"].delta_indices,
+            delta_indices=state.delta_indices,
             modality_keys=[state_key],
         )
         # Check state-action consistency
@@ -186,26 +253,12 @@ class RelativeActionLoader:
             last_state = state_data[state_ind]
             actions = action_data[action_inds]
             if self.action_config.type == ActionType.EEF:
-                # raise NotImplementedError("EEF action is not yet supported")
-                assert len(last_state) == 9  # xyz + rot6d
-                assert actions.shape[1] == 9  # xyz + rot6d
-
-                reference_frame = EndEffectorPose(
-                    translation=last_state[:3],
-                    rotation=last_state[3:],
-                    rotation_type="rot6d",
+                action_format = self.action_config.format
+                reference_frame = EndEffectorPose.from_action_format(last_state, action_format)
+                traj = EndEffectorActionChunk.from_array(actions, action_format).relative_chunking(
+                    reference_frame=reference_frame
                 )
-
-                traj = EndEffectorActionChunk(
-                    [
-                        EndEffectorPose(translation=m[:3], rotation=m[3:], rotation_type="rot6d")
-                        for m in actions
-                    ]
-                ).relative_chunking(reference_frame=reference_frame)
-
-                raise NotImplementedError(
-                    "EEF action is not yet supported, need to handle rotation transformation based on action format"
-                )
+                trajectories.append(traj.to(action_format).astype(np.float32))
             elif self.action_config.type == ActionType.NON_EEF:
                 reference_frame = JointPose(last_state)
                 traj = JointActionChunk([JointPose(m) for m in actions]).relative_chunking(
@@ -222,11 +275,11 @@ class RelativeActionLoader:
 
 def calculate_stats_for_key(
     dataset_path: Path | str,
-    embodiment_tag: EmbodimentTag,
+    modality_configs: dict[str, ModalityConfig],
     group_key: str,
     max_episodes: int = -1,
 ) -> dict:
-    loader = RelativeActionLoader(dataset_path, embodiment_tag, group_key)
+    loader = RelativeActionLoader(dataset_path, modality_configs, group_key)
     trajectories = []
     for episode_id in tqdm(range(len(loader)), desc=f"Loading trajectories for key {group_key}"):
         if max_episodes != -1 and episode_id >= max_episodes:
@@ -242,9 +295,11 @@ def calculate_stats_for_key(
     }
 
 
-def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) -> None:
+def generate_rel_stats(
+    dataset_path: Path | str, modality_configs: dict[str, ModalityConfig]
+) -> None:
     dataset_path = Path(dataset_path)
-    action_config = MODALITY_CONFIGS[embodiment_tag.value]["action"]
+    action_config = modality_configs["action"]
     if action_config.action_configs is None:
         return
     action_keys = [
@@ -253,23 +308,25 @@ def generate_rel_stats(dataset_path: Path | str, embodiment_tag: EmbodimentTag) 
         if action_config.rep == ActionRepresentation.RELATIVE
     ]
     stats_path = Path(dataset_path) / LE_ROBOT_REL_STATS_FILENAME
-    if stats_path.exists():
-        with open(stats_path, "r") as f:
-            stats = json.load(f)
-    else:
-        stats = {}
-    for action_key in sorted(action_keys):
-        if action_key in stats:
-            continue
-        print(f"Generating relative stats for {dataset_path} {embodiment_tag} {action_key}")
-        stats[action_key] = calculate_stats_for_key(dataset_path, embodiment_tag, action_key)
-    with open(stats_path, "w") as f:
-        json.dump(to_json_serializable(dict(stats)), f, indent=4)
+    with _dataset_lock(dataset_path):
+        if stats_path.exists():
+            with open(stats_path, "r") as f:
+                stats = json.load(f)
+        else:
+            stats = {}
+        missing = [k for k in sorted(action_keys) if not _has_required_relative_stats(stats.get(k))]
+        if not missing:
+            return
+        for action_key in missing:
+            print(f"Generating relative stats for {dataset_path} {action_key}")
+            stats[action_key] = calculate_stats_for_key(dataset_path, modality_configs, action_key)
+        write_json_atomic(stats_path, to_json_serializable(dict(stats)))
 
 
 def main(dataset_path: Path | str, embodiment_tag: EmbodimentTag):
     generate_stats(dataset_path)
-    generate_rel_stats(dataset_path, embodiment_tag)
+    if embodiment_tag.value in MODALITY_CONFIGS:
+        generate_rel_stats(dataset_path, MODALITY_CONFIGS[embodiment_tag.value])
 
 
 if __name__ == "__main__":

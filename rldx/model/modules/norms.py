@@ -4,6 +4,13 @@ import torch
 import torch.nn as nn
 
 
+def adaptive_layer_norm(
+    norm: nn.Module, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+) -> torch.Tensor:
+    output = (1 + scale.float()) * norm(x.float()) + shift.float()
+    return output.to(x.dtype)
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization.
 

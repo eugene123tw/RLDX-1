@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+from rldx.dist import rank_zero_print as _print
 from rldx.experiment.features.context import AssemblyContext
-from rldx.utils.dist import rank_zero_print as _print
+
+
+def _physics_delta_indices(keys: list[str], modality_configs) -> list[int]:
+    for modalities in modality_configs.values():
+        for key in keys:
+            if key in modalities and modalities[key].delta_indices:
+                return list(modalities[key].delta_indices)
+    return []
 
 
 class PhysicsFeature:
@@ -12,33 +22,28 @@ class PhysicsFeature:
 
     @staticmethod
     def is_active(cli) -> bool:
-        return cli.use_physics
+        return cli.physics is not None
 
     @staticmethod
     def apply(ctx: AssemblyContext) -> None:
-        cli = ctx.cli
-        model = ctx.model
         modality_configs = ctx.modality_configs
-
-        physics_keys = cli.physics_keys or []
-        physics_dims = cli.physics_dims or []
-        assert len(physics_keys) > 0, (
-            "--use-physics requires --physics-keys with at least one key (e.g. tactile, torque)"
-        )
-        assert len(physics_dims) == len(physics_keys), (
-            f"--physics-dims length ({len(physics_dims)}) must match "
-            f"--physics-keys length ({len(physics_keys)})"
-        )
+        physics = ctx.cli.physics.to_config(ctx.model.physics)
+        physics_keys = physics.keys
+        # Without a physics modality, delta_indices carries over from the checkpoint,
+        # and use_flow_matching always does.
+        delta = _physics_delta_indices(physics_keys, modality_configs)
+        if delta:
+            physics = replace(physics, delta_indices=delta)
         # Read-only validation: shared delta_indices across physics modalities
         for emb_key in modality_configs:
             ref_delta = None
             has_any_physics = any(pk in modality_configs[emb_key] for pk in physics_keys)
             if not has_any_physics:
-                if not cli.allow_missing_physics:
+                if not physics.allow_missing:
                     raise ValueError(
                         f"Embodiment '{emb_key}' has no physics modality keys "
                         f"{physics_keys} in its modality config. "
-                        f"Use --allow-missing-physics to allow this."
+                        f"Use --physics.allow-missing to allow this."
                     )
                 continue
             for pk in physics_keys:
@@ -53,20 +58,10 @@ class PhysicsFeature:
                             f"reference: {ref_delta}"
                         )
 
-        model.use_physics = True
-        model.physics_keys = physics_keys
-        model.physics_dims = physics_dims
-        model.physics_loss_weight = cli.physics_loss_weight
-        model.allow_missing_physics = cli.allow_missing_physics
-        model.physics_dropout_prob = cli.physics_dropout_prob
+        ctx.model.physics = physics
         _print(
-            f"[i] use_physics: True, physics_keys: {physics_keys}, "
-            f"physics_dims: {physics_dims}, physics_dim (total): {sum(physics_dims)}, "
-            f"loss_weight: {cli.physics_loss_weight}, "
-            f"allow_missing: {cli.allow_missing_physics}, "
-            f"dropout_prob: {cli.physics_dropout_prob}"
+            f"[i] physics: keys {physics.keys}, dims {physics.dims} "
+            f"(total {sum(physics.dims)}), loss_weight {physics.loss_weight}, "
+            f"allow_missing {physics.allow_missing}, dropout_prob {physics.dropout_prob}, "
+            f"delta_indices {physics.delta_indices}"
         )
-
-    @staticmethod
-    def required_state_dict_prefixes() -> frozenset[str]:
-        return frozenset()

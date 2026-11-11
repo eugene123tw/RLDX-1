@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from rldx.dist import rank_zero_print as _print
 from rldx.experiment.features.context import AssemblyContext
-from rldx.utils.dist import rank_zero_print as _print
 
 
 class VideoFeature:
@@ -35,9 +35,4 @@ class VideoFeature:
             if "video" in ctx.modality_configs[emb_key]:
                 ctx.add_strides(emb_key, "video", strides)
 
-        ctx.data.allow_padding = True
         _print(f"[i] Using video strides: {sorted(strides)}")
-
-    @staticmethod
-    def required_state_dict_prefixes() -> frozenset[str]:
-        return frozenset()

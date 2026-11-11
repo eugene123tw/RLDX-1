@@ -16,15 +16,226 @@
 # This file has been modified from the original NVIDIA Isaac GR00T N1.7.
 # Original source: https://github.com/NVIDIA/Isaac-GR00T
 
-from dataclasses import MISSING, asdict, dataclass, field, is_dataclass
-from enum import Enum
-import json
-from pathlib import Path
+from dataclasses import MISSING, Field, asdict, dataclass, field, fields, is_dataclass
+from types import MappingProxyType
 
-import torch
 from transformers import PretrainedConfig
 
 from . import register_model_config
+from .rldx_v1 import RLDXConfigFormatV1
+
+
+FORMAT_VERSION = 2
+HF_CONFIG_KEYS = frozenset(PretrainedConfig().to_dict()) | {
+    "attn_implementation",
+    "torch_dtype",
+    "num_labels",
+    "name_or_path",
+    "_commit_hash",
+}
+
+
+def internal():
+    """A field the released tree does not have. None means off: it is not saved, and a v2 file
+    without the field loads None."""
+    return field(default=None, metadata={"internal": True})
+
+
+def internal_off(f: Field, value) -> bool:
+    """Whether ``f`` is internal and ``value`` is off."""
+    return f.metadata.get("internal", False) and value is None
+
+
+def internal_on(config) -> list[str]:
+    """The internal fields of ``config`` and its sub-configs that are on."""
+    on = []
+    for f in fields(config):
+        value = getattr(config, f.name)
+        if is_dataclass(value):
+            on += [f"{f.name}.{name}" for name in internal_on(value)]
+        elif f.metadata.get("internal") and not internal_off(f, value):
+            on.append(f.name)
+    return on
+
+
+# MSAT kwargs a saved diffusion_model_cfg may leave out; RLDXActionModel fills them when it
+# builds MSAT. A new config starts from these with the shorter max sequence length.
+MSAT_DEFAULTS = MappingProxyType(
+    {
+        "attention_head_dim": 64,
+        "depth_multi_stream": 4,
+        "depth_single_stream": 8,
+        "dropout": 0.2,
+        "final_dropout": True,
+        "num_attention_heads": 24,
+        "output_dim": 1024,
+        "positional_embeddings": "rope_sa_only",
+        "rope_theta": 10000.0,
+        "temb_type": "input_token",
+        "use_swiglu": True,
+        "action_model_max_seq_len": 1024,
+        "pre_norm": "layer_norm",
+        "qk_norm": "rms_norm",
+    }
+)
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    length: int = 4  # past timesteps kept (= context window)
+    n_cog_tokens: int | None = 16  # cognition tokens routed through memory; None = all
+    concat: bool = True  # False replaces the routed tokens instead of appending
+    dropout_prob: float = 0.0
+    stride: int = 16  # action steps between memory snapshots (= execution horizon)
+    cfg: dict = field(
+        default_factory=lambda: {
+            "hidden_size": 4096,
+            "intermediate_size": 16384,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "max_position_embeddings": 32,
+            "rms_norm_eps": 1e-5,
+            "use_causal_attn": True,
+            "use_rope": True,
+        }
+    )
+
+    def __post_init__(self):
+        if self.dropout_prob > 0.0 and not self.concat:
+            raise ValueError("memory dropout_prob > 0.0 requires concat=True")
+
+
+@dataclass(frozen=True)
+class MotionConfig:
+    insert_layer: int = 9
+    d_hid: int = 512
+    window: tuple[int, ...] = (5, 9, 9)
+    ext_chnls: tuple[int, ...] = (256,)
+    int_chnls: tuple[int, ...] = (256, 256, 512)
+    corr_func: str = "cosine"
+    n_encoders: int = 1
+    use_layerscale: bool = False
+    layerscale_init: float = 1e-5
+    use_layernorm: bool = True  # GroupNorm(1); v1 configs keep their BN default (rldx_v1.py)
+    use_syncbn: bool = False
+    injection_point: str = "vision_encoder"  # "vision_encoder" or "vl_input"
+    pool_type: str = "avg"  # "avg" or "conv" (spatial pooling for vl_input)
+    drop: bool = True  # drop motion tokens at the internal_projection layer
+    gradient_check: bool = False  # log motion module gradient norms during training
+
+    def __post_init__(self):
+        # JSON has no tuples.
+        for name in ("window", "ext_chnls", "int_chnls"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+
+    def vision_config(self) -> dict:
+        return {"use_motion": True, **{f"motion_{k}": v for k, v in asdict(self).items()}}
+
+
+@dataclass(frozen=True)
+class PhysicsConfig:
+    keys: list[str]  # e.g. ["tactile", "torque"]
+    dims: list[int]  # per key, aligned with keys (e.g. [30, 7])
+    loss_weight: float = 0.1
+    allow_missing: bool = False  # samples without physics are zero-filled and masked
+    delta_indices: list[int] | None = None  # set from the modality config; <=0 hist, >0 fut
+    use_flow_matching: bool = True  # False: all-conditioning + MSE loss
+    dropout_prob: float = 0.0  # flow matching drops history tokens only, MSE the whole sequence
+
+    def __post_init__(self):
+        if not self.keys or len(self.dims) != len(self.keys):
+            raise ValueError(
+                f"physics needs dims for every key; got keys={self.keys}, dims={self.dims}"
+            )
+
+    @property
+    def dim(self) -> int:
+        return sum(self.dims)
+
+
+@dataclass(frozen=True)
+class ActionModelLoraConfig:
+    rank: int = 16
+    alpha: int = 32
+    dropout: float = 0.0
+    # MSAT linears; p_qkv/p_proj apply only to an MSAT built with physics.
+    target_modules: list[str] = field(
+        default_factory=lambda: [
+            "vl_qkv",
+            "vl_proj",
+            "sa_qkv",
+            "sa_proj",
+            "p_qkv",
+            "p_proj",
+            "linear1",
+            "linear2",
+        ]
+    )
+
+    def __post_init__(self):
+        if type(self.rank) is not int or self.rank <= 0:
+            raise ValueError(f"action-model-lora needs rank > 0, got {self.rank!r}")
+        if type(self.alpha) is not int or self.alpha <= 0:
+            raise ValueError(f"action-model-lora needs alpha > 0, got {self.alpha!r}")
+
+
+@dataclass(frozen=True)
+class BackboneLoraConfig:
+    rank: int = 16
+    alpha: int = 32
+    dropout: float = 0.0
+    num_layers: int = -1  # top-N LLM layers; -1 = all
+    target_modules: list[str] = field(
+        default_factory=lambda: [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+    )
+
+    def __post_init__(self):
+        if type(self.rank) is not int or self.rank <= 0:
+            raise ValueError(f"backbone-lora needs rank > 0, got {self.rank!r}")
+        if type(self.alpha) is not int or self.alpha <= 0:
+            raise ValueError(f"backbone-lora needs alpha > 0, got {self.alpha!r}")
+        if type(self.num_layers) is not int or (self.num_layers <= 0 and self.num_layers != -1):
+            raise ValueError(
+                f"backbone-lora needs num_layers > 0 or -1 (all), got {self.num_layers!r}"
+            )
+
+
+FEATURE_CONFIGS = {
+    "memory": MemoryConfig,
+    "motion": MotionConfig,
+    "physics": PhysicsConfig,
+    "action_model_lora": ActionModelLoraConfig,
+    "backbone_lora": BackboneLoraConfig,
+}
+
+
+def default_color_jitter_params() -> dict[str, float]:
+    return {"brightness": 0.3, "contrast": 0.4, "saturation": 0.5, "hue": 0.08}
+
+
+@dataclass(frozen=True)
+class ImageGeometryConfig:
+    max_area: int = 65536  # aspect-preserving resize to this many pixels, 256 * 256 by default
+    resize_m: int = 32  # both sides aligned to this multiple
+    crop_fraction: float | None = None  # train: random crop, eval: center crop; None = no crop
+
+
+@dataclass(frozen=True)
+class ImageAugmentationConfig:
+    rotation_angle: int | None = None
+    color_jitter: dict[str, float] | None = field(default_factory=default_color_jitter_params)
+
+
+IMAGE_CONFIGS = {"image": ImageGeometryConfig, "augmentation": ImageAugmentationConfig}
 
 
 @dataclass
@@ -49,32 +260,16 @@ class RLDXConfig(PretrainedConfig):
     reproject_vision: bool = False
     use_flash_attention: bool = True
     load_bf16: bool = True  # Enable BF16 loading
-    backbone_trainable_params_fp32: bool = True
     freeze_cog_tokens: bool = False  # Freeze cog_emb to prevent VLM backprop
 
-    ### Image pipeline parameters
-    # Step 1 — aspect-ratio-preserving resize + m-aligned crop
-    image_max_area: int = 65536  # 256 * 256 by default
-    image_resize_m: int = 32
-    # Step 2 — optional fractional crop + resize-back (train: random, eval: center)
-    random_crop_fraction: float | None = None  # None = no-op
-    # Step 3 — optional photometric / geometric augmentation (train only)
-    random_rotation_angle: int | None = None
-    # None disables color jitter (no transform added). See rldx/data/augmentations.py.
-    color_jitter_params: dict[str, float] | None = field(
-        default_factory=lambda: {
-            "brightness": 0.3,
-            "contrast": 0.4,
-            "saturation": 0.5,
-            "hue": 0.08,
-        }
-    )
+    image: ImageGeometryConfig = field(default_factory=ImageGeometryConfig)
+    augmentation: ImageAugmentationConfig = field(default_factory=ImageAugmentationConfig)
     formalize_language: bool = True
     apply_sincos_state_encoding: bool = (
         False  # Global flag to enable per-embodiment sin/cos encoding
     )
     use_relative_action: bool = True
-    use_percentiles: bool = True
+    use_percentiles: bool = True  # True normalizes to q01/q99, False to min/max
     conversation_image_first: bool = False
 
     # Action head configuration parameters
@@ -85,31 +280,18 @@ class RLDXConfig(PretrainedConfig):
     input_embedding_dim: int = 1536
     general_embodiment_train_ratio: float = 0
 
+    mask_padded_action_dims: bool = True
+
     # Global parameters from YAML
     add_pos_embed: bool = True
-    attn_dropout: float = 0.2
+    attn_dropout: float = 0.0
     use_vlln: bool = False
     max_seq_len: int = 1024
 
     # MSAT configuration
     n_cog_tokens: int = 64
     diffusion_model_cfg: dict = field(
-        default_factory=lambda: {
-            "attention_head_dim": 64,
-            "depth_multi_stream": 4,
-            "depth_single_stream": 8,
-            "dropout": 0.2,
-            "final_dropout": True,
-            "num_attention_heads": 24,
-            "output_dim": 1024,
-            "positional_embeddings": "rope_sa_only",
-            "rope_theta": 10000.0,
-            "temb_type": "input_token",
-            "use_swiglu": True,
-            "action_model_max_seq_len": 512,
-            "pre_norm": "layer_norm",
-            "qk_norm": "rms_norm",
-        }
+        default_factory=lambda: {**MSAT_DEFAULTS, "action_model_max_seq_len": 512}
     )
 
     # Flow matching parameters
@@ -124,131 +306,22 @@ class RLDXConfig(PretrainedConfig):
     tune_diffusion_model: bool = True
     tune_vlln: bool = True
 
-    # Action model (MSAT) LoRA. When ``action_model_use_lora=True``,
-    # ``RLDXActionModel.set_trainable_parameters`` injects PEFT LoRA
-    # adapters into the MSAT linear projections listed in
-    # ``action_model_lora_target_modules`` instead of full-tuning the DiT.
-    # The default target list covers MSAT's V-L / state-action / physics
-    # QKV + output projections + the MMDiT inner FFN linears (see
-    # ``rldx/model/modules/action_model/blocks.py``). Targets that don't
-    # exist in the current MSAT (e.g. ``p_qkv``/``p_proj`` when
-    # ``use_physics=False``) are filtered before the PEFT call.
-    action_model_use_lora: bool = False
-    action_model_lora_rank: int = 16
-    action_model_lora_alpha: int = 32
-    action_model_lora_dropout: float = 0.0
-    action_model_lora_target_modules: list[str] = field(
-        default_factory=lambda: [
-            "vl_qkv",
-            "vl_proj",
-            "sa_qkv",
-            "sa_proj",
-            "p_qkv",
-            "p_proj",
-            "linear1",
-            "linear2",
-        ]
-    )
-
-    # Backbone (Qwen3 LLM) LoRA. Mirror of the action-model surface:
-    # ``backbone_use_lora`` toggles PEFT injection into the LLM layers;
-    # ``backbone_lora_num_layers`` picks the top-N suffix (-1 = all layers,
-    # 0 = skip, N > 0 = last N). When LoRA is active the backbone is set
-    # to ``requires_grad_(False)`` first and only the injected LoRA params
-    # remain trainable — so ``tune_top_llm_layers`` is effectively ignored
-    # (the launcher warns about the conflict).
-    # ``backbone_lora_target_modules`` covers Qwen3 attention + MLP
-    # projections.
-    backbone_use_lora: bool = False
-    backbone_lora_rank: int = 16
-    backbone_lora_alpha: int = 32
-    backbone_lora_dropout: float = 0.0
-    backbone_lora_num_layers: int = -1
-    backbone_lora_target_modules: list[str] = field(
-        default_factory=lambda: [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ]
-    )
+    action_model_lora: ActionModelLoraConfig | None = None
+    # A set LoRA trains only its adapters; the tune fields of its part do not apply.
+    backbone_lora: BackboneLoraConfig | None = None
 
     # State Augmentation parameters
     state_dropout_prob: float = 0.3  # State dropout probability
     state_additive_noise_scale: float = 0.0  # Scale for additive Gaussian noise on state features
 
-    # Real-Time Chunking (RTC). See rldx/model/modules/action_model/rtc.py.
-    #   training_max_delay: if > 0, each training step samples a per-sample
-    #     prefix length in [0, max_delay]; those positions use ground-truth
-    #     clean actions and do not contribute to the loss.
-    #   inference_mode: "none" / "trained" / "guided". Any non-none
-    #     mode requires a non-zero inference_delay and an action_prefix in
-    #     action_input at inference time.
-    # NOTE: rtc_jacobian_beta is intentionally NOT a model-config field — it
-    # is an inference-time guidance knob, not a property of the trained model.
-    # The eval server (`run_rldx_server.py`) accepts it as a CLI override and
-    # `rtc_config_from_rldx` falls back to RTCConfig's default when absent.
+    # Real-Time Chunking (RTC, rldx/model/modules/action_model/rtc.py): if > 0,
+    # each training sample freezes a clean prefix of length U[0, max_delay] and
+    # takes no loss on it. How to run RTC is InferenceConfig.rtc.
     rtc_training_max_delay: int = 0
-    rtc_inference_mode: str = "none"
-    rtc_inference_delay: int = 0
-    rtc_inference_exec_horizon: int = 0  # s; 0 => action_horizon - inference_delay
-    # Apply Jacobian guidance only on the first N denoising steps. Default 3
-    # (skip last τ→1 step where VJP residual is mostly numerical noise on
-    # RLDX/MSAT). None = all steps, 1 = cheapest single-step variant.
-    rtc_jacobian_steps_only: int | None = 3
 
-    # Memory configuration
-    use_memory: bool = False  # Enable memory-augmented cognition tokens
-    memory_length: int = 4  # Number of past timesteps for memory (= context_window)
-    memory_n_cog_tokens: int | None = (
-        None  # Number of cognition tokens routed through memory (defaults to n_cog_tokens)
-    )
-    concat_memory: bool = (
-        False  # If True, concat MQ_augmented after MQ_original instead of replacing
-    )
-    memory_dropout_prob: float = (
-        0.0  # Dropout ratio for augmented cognition tokens (concat_memory=True only, mask-out)
-    )
-    memory_stride: int = (
-        16  # Action-step stride between memory snapshots (should match execution_horizon)
-    )
-    memory_cfg: dict = field(
-        default_factory=lambda: {
-            "hidden_size": 4096,
-            "intermediate_size": 16384,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 16,
-            "max_position_embeddings": 32,
-            "rms_norm_eps": 1e-5,
-            "use_causal_attn": True,
-            "use_rope": True,
-        }
-    )
+    memory: MemoryConfig | None = None
 
-    # motion module configuration
-    use_motion: bool = False
-    motion_insert_layer: int = 9
-    motion_d_hid: int = 512
-    motion_window: tuple = (5, 9, 9)
-    motion_ext_chnls: tuple = (256,)
-    motion_int_chnls: tuple = (256, 256, 512)
-    motion_corr_func: str = "cosine"
-    motion_n_encoders: int = 1
-    motion_use_layerscale: bool = False
-    motion_layerscale_init: float = 1e-5
-    motion_use_layernorm: bool = False
-    motion_use_syncbn: bool = False
-    motion_injection_point: str = "vision_encoder"  # "vision_encoder" or "vl_input"
-    motion_pool_type: str = "avg"  # "avg" or "conv" (spatial pooling for vl_input)
-    motion_drop: bool = True  # drop motion module tokens at internal_projection layer
-    motion_gradient_check: bool = False  # log motion module gradient norms during training
-    motion_int_mode: str = (
-        "lite"  # "lite" (1x1 Conv3d L-fuse, default) or "full" (3-layer 3x3 conv stack)
-    )
+    motion: MotionConfig | None = None
 
     # Video input configuration
     # ``use_video`` is an architectural invariant: every supported
@@ -260,34 +333,15 @@ class RLDXConfig(PretrainedConfig):
     video_length: int = 4
     video_stride: int = 2  # Action-step stride between video frames in context window
 
-    # Physics (tactile/torque) configuration
-    use_physics: bool = False
-    physics_keys: list[str] = field(default_factory=list)  # e.g., ["tactile", "torque"]
-    physics_dims: list[int] = field(
-        default_factory=list
-    )  # Per-key dimensions, aligned with `physics_keys` (e.g., [30, 7])
-    physics_loss_weight: float = 0.1
-    allow_missing_physics: bool = (
-        False  # If True, samples without physics data are zero-filled and attention-masked
-    )
-    physics_delta_indices: list[int] | None = (
-        None  # Injected from modality_configs in setup.py; d<=0 = hist, d>0 = fut
-    )
-    physics_use_flow_matching: bool = True  # False switches to the all-conditioning + MSE loss path
-    physics_dropout_prob: float = 0.0
-    """Per-sample dropout on physics conditioning tokens during training.
-    Flow-matching mode drops only history tokens; the MSE-loss path drops
-    the full sequence."""
-
-    @property
-    def physics_dim(self) -> int:
-        """Total physics dimension, derived from physics_dims."""
-        return sum(self.physics_dims) if self.physics_dims else 0
+    physics: PhysicsConfig | None = None
 
     # Multi-embodiment parameters
-    max_num_embodiments: int = 36
+    max_num_embodiments: int = 8
 
     def __init__(self, **kwargs):
+        unknown = kwargs.keys() - self.__dataclass_fields__.keys() - HF_CONFIG_KEYS
+        if unknown:
+            raise TypeError(f"RLDXConfig got unknown fields {sorted(unknown)}")
         super().__init__(**kwargs)
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -297,13 +351,49 @@ class RLDXConfig(PretrainedConfig):
         # (PretrainedConfig) interferes with normal default injection.
         self._fill_missing_defaults()
 
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        fields = cls.__dataclass_fields__.keys()
+        hf = {k: v for k, v in config_dict.items() if k in HF_CONFIG_KEYS and k not in fields}
+        saved = {k: v for k, v in config_dict.items() if k not in hf and k != "format_version"}
+        fields = cls._fields(config_dict.get("format_version"), saved)
+        for name, feature in FEATURE_CONFIGS.items():
+            if fields[name] is not None:
+                fields[name] = feature(**fields[name])
+        for name, sub_config in IMAGE_CONFIGS.items():
+            fields[name] = sub_config(**fields[name])
+        return super().from_dict({**hf, **fields}, **kwargs)
+
+    @classmethod
+    def _fields(cls, version, saved: dict) -> dict:
+        saved = _drop_removed_keys(saved)
+        if version is None:
+            return RLDXConfigFormatV1.to_v2(saved)
+        if version != FORMAT_VERSION:
+            raise ValueError(f"unknown format_version {version!r}")
+        declared = cls.__dataclass_fields__
+        required = {name for name, f in declared.items() if not f.metadata.get("internal")}
+        missing, unknown = sorted(required - saved.keys()), sorted(saved.keys() - declared.keys())
+        if missing or unknown:
+            raise ValueError(
+                f"format_version {version} config is missing {missing}, has unknown {unknown}"
+            )
+        return saved
+
+    def to_dict(self):
+        return {k: _plain(v) for k, v in super().to_dict().items()}
+
+    def to_diff_dict(self):
+        hf = {k: v for k, v in super().to_diff_dict().items() if k not in self.__dataclass_fields__}
+        return {**hf, **_saved(self), "format_version": FORMAT_VERSION}
+
     def _fill_missing_defaults(self):
         """Set default values for any dataclass fields not yet on the instance."""
         for f in self.__dataclass_fields__.values():
             if not hasattr(self, f.name):
                 if f.default is not MISSING:
                     setattr(self, f.name, f.default)
-                elif getattr(f, "default_factory", MISSING) is not MISSING:
+                elif f.default_factory is not MISSING:
                     setattr(self, f.name, f.default_factory())
 
     def __getattr__(self, name: str):
@@ -313,40 +403,52 @@ class RLDXConfig(PretrainedConfig):
         # on this class — fail fast.
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
-    def to_filtered_dict(self, exclude_augment: bool = True) -> dict:
-        """Return a dictionary representation of this config, optionally excluding augmentation keys."""
-        if is_dataclass(self):
-            cfg = asdict(self)
-        else:
-            cfg = dict(self.__dict__)
 
-        if exclude_augment:
-            exclude_keys = {
-                "random_rotation_angle",
-                "color_jitter_params",
-                "random_crop_fraction",
-                "formalize_language",
-            }
-            cfg = {k: v for k, v in cfg.items() if k not in exclude_keys}
+# diffusion_model_cfg keys of removed features and the value that had them off.
+REMOVED_MSAT_KEYS = MappingProxyType({"use_blockwise_causal_mask": False, "meta_q_dropout": 0.0})
 
-        return cfg
 
-    def to_filtered_json(self, exclude_augment: bool = True, **kwargs) -> str:
-        """Return a JSON string of this config, optionally excluding augmentation keys."""
+def _drop_removed_keys(saved: dict) -> dict:
+    """Drops the keys of removed features when they were off; refuses a config that used one."""
+    saved = dict(saved)
+    if saved.pop("extra_augmentation_config", None) is not None:
+        raise ValueError("config uses removed extra_augmentation_config (mask-guided augmentation)")
+    if "augmentation" in saved:
+        augmentation = dict(saved["augmentation"])
+        if augmentation.pop("mask_guided", None) is not None:
+            raise ValueError("config uses removed augmentation.mask_guided")
+        saved["augmentation"] = augmentation
+    if "normalization_type" in saved:
+        mode = saved.pop("normalization_type")
+        use_percentiles = saved.get("use_percentiles", True)
+        if mode != ("q99" if use_percentiles else "minmax"):
+            raise ValueError(
+                f"config normalizes with normalization_type={mode!r}, "
+                f"use_percentiles={use_percentiles}; only q99 (use_percentiles=True) and "
+                "minmax (use_percentiles=False) are supported"
+            )
+    if "diffusion_model_cfg" in saved:
+        msat = dict(saved["diffusion_model_cfg"])
+        for key, off in REMOVED_MSAT_KEYS.items():
+            if msat.pop(key, off) != off:
+                raise ValueError(f"config uses removed diffusion_model_cfg.{key}")
+        saved["diffusion_model_cfg"] = msat
+    return saved
 
-        def default(o):
-            if isinstance(o, (Path, torch.dtype, torch.device)):
-                return str(o)
-            if isinstance(o, Enum):
-                return o.value
-            return str(o)
 
-        return json.dumps(
-            self.to_filtered_dict(exclude_augment),
-            indent=2,
-            default=default,
-            **kwargs,
-        )
+def _plain(value):
+    sub_configs = (*FEATURE_CONFIGS.values(), *IMAGE_CONFIGS.values())
+    return asdict(value) if value is not None and type(value) in sub_configs else value
+
+
+def _saved(config) -> dict:
+    """The fields of ``config`` to write, with internal fields that are off left out."""
+    saved = {}
+    for f in fields(config):
+        value = getattr(config, f.name)
+        if not internal_off(f, value):
+            saved[f.name] = _saved(value) if is_dataclass(value) else value
+    return saved
 
 
 register_model_config("RLDX-1", RLDXConfig)

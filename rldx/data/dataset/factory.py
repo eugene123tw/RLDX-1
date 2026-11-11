@@ -16,64 +16,47 @@
 # This file has been modified from the original NVIDIA Isaac GR00T N1.7.
 # Original source: https://github.com/NVIDIA/Isaac-GR00T
 
+from pathlib import Path
+from typing import Mapping
+
 import numpy as np
 import torch
 from tqdm import tqdm
 
 from rldx.configs.base_config import Config
+from rldx.data.dataset.lerobot_shard_source import LeRobotShardSource
 from rldx.data.dataset.sharded_mixture_dataset import ShardedMixtureDataset
-from rldx.data.dataset.sharded_single_step_dataset import ShardedSingleStepDataset
-from rldx.data.dataset.standard_mixture_dataset import StandardMixtureDataset
-from rldx.data.dataset.standard_single_step_dataset import StandardSingleStepDataset
 from rldx.data.embodiment_tags import EmbodimentTag
 from rldx.data.interfaces import BaseProcessor
 from rldx.data.stats import generate_rel_stats, generate_stats
-from rldx.experiment.dist_utils import barrier
+from rldx.dist import barrier
 
 
 class DatasetFactory:
     """
     Factory class for building training datasets. Model-agnostic.
 
-    Supports two dataset modes (configured via ``config.data.dataset_mode``):
-
-    * ``"sharded"`` (default): Pre-shards episodes into fixed-size shard files.
-      Episodes are grouped by shard, loaded in bulk, and background-prefetched.
-      Controlled by ``shard_size`` and ``episode_sampling_rate``.
-
-    * ``"standard"``: Map-style dataset where every valid (episode, step) pair
-      is a directly addressable index.  No pre-sharding; the per-episode cache
-      inside StandardSingleStepDataset amortises episode loading cost.
-      ``episode_sampling_rate`` is ignored; all valid steps are included.
+    Builds the canonical shard-planned dataset pipeline.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, held_out: Mapping[Path, frozenset[int]]):
         self.config = config
+        # Validation episodes by resolved path; ValidationSpec.check made every key a training path.
+        self.held_out = held_out
 
     def _ensure_stats(self, dataset_path: str, embodiment_tag: str) -> None:
         """Generate dataset statistics if not already present (rank-0 only, then barrier)."""
+        modality_configs = self.config.data.modality_configs[embodiment_tag]
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 generate_stats(dataset_path)
-                generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
+                generate_rel_stats(dataset_path, modality_configs)
         else:
             generate_stats(dataset_path)
-            generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
+            generate_rel_stats(dataset_path, modality_configs)
         barrier()
 
-    def build(
-        self, processor: BaseProcessor
-    ) -> tuple[ShardedMixtureDataset | StandardMixtureDataset, None]:
-        """Build the dataset. Returns a tuple of (train_dataset, eval_dataset)."""
-        assert self.config.training.eval_strategy == "no", (
-            "Sharded dataset does not support evaluation sets"
-        )
-
-        dataset_mode = getattr(self.config.data, "dataset_mode", "sharded")
-        assert dataset_mode in ("sharded", "standard"), (
-            f"Unknown dataset_mode '{dataset_mode}'. Choose 'sharded' or 'standard'."
-        )
-
+    def build(self, processor: BaseProcessor) -> ShardedMixtureDataset:
         all_datasets = []
         all_weights = []
         for dataset_spec in tqdm(
@@ -89,52 +72,42 @@ class DatasetFactory:
 
                 self._ensure_stats(dataset_path, embodiment_tag)
 
-                if dataset_mode == "sharded":
-                    dataset = ShardedSingleStepDataset(
-                        dataset_path=dataset_path,
-                        embodiment_tag=EmbodimentTag(embodiment_tag),
-                        modality_configs=self.config.data.modality_configs[embodiment_tag],
-                        video_backend=self.config.data.video_backend,
-                        shard_size=self.config.data.shard_size,
-                        episode_sampling_rate=self.config.data.episode_sampling_rate,
-                        seed=self.config.data.seed,
-                        allow_padding=self.config.data.allow_padding,
-                    )
-                else:
-                    dataset = StandardSingleStepDataset(
-                        dataset_path=dataset_path,
-                        embodiment_tag=EmbodimentTag(embodiment_tag),
-                        modality_configs=self.config.data.modality_configs[embodiment_tag],
-                        video_backend=self.config.data.video_backend,
-                        allow_padding=self.config.data.allow_padding,
-                    )
+                dataset = LeRobotShardSource(
+                    dataset_path=dataset_path,
+                    embodiment_tag=EmbodimentTag(embodiment_tag),
+                    modality_configs=self.config.data.modality_configs[embodiment_tag],
+                    shard_size=self.config.data.shard_size,
+                    episode_sampling_rate=self.config.data.episode_sampling_rate,
+                    seed=self.config.data.seed,
+                    excluded_episode_ids=self.held_out.get(Path(dataset_path).resolve()),
+                    boundary_policy=self.config.data.episode_boundary_policy,
+                )
 
                 datasets.append(dataset)
 
             dataset_lengths = np.array([len(dataset) for dataset in datasets])
             dataset_relative_lengths = dataset_lengths / dataset_lengths.sum()
-            for dataset, relative_length in zip(datasets, dataset_relative_lengths):
+            weight_by_steps = self.config.data.dataset_weight_by_steps
+            for dataset, relative_length, raw_length in zip(
+                datasets, dataset_relative_lengths, dataset_lengths
+            ):
                 weight = relative_length * dataset_spec.mix_ratio
+                if weight_by_steps:
+                    # Multiply by raw step count so cross-dataset sampling
+                    # is proportional to total steps; mix_ratio then acts as
+                    # a boost/suppress multiplier on top of length-proportional
+                    # sampling.
+                    weight *= float(raw_length)
                 all_datasets.append(dataset)
                 all_weights.append(weight)
 
-        if dataset_mode == "sharded":
-            train_dataset = ShardedMixtureDataset(
-                datasets=all_datasets,
-                weights=all_weights,
-                processor=processor,
-                seed=self.config.data.seed,
-                training=True,
-                num_shards_per_epoch=self.config.data.num_shards_per_epoch,
-                override_pretraining_statistics=self.config.data.override_pretraining_statistics,
-            )
-        else:
-            train_dataset = StandardMixtureDataset(
-                datasets=all_datasets,
-                weights=all_weights,
-                processor=processor,
-                seed=self.config.data.seed,
-                override_pretraining_statistics=self.config.data.override_pretraining_statistics,
-            )
-
-        return train_dataset, None
+        return ShardedMixtureDataset(
+            datasets=all_datasets,
+            weights=all_weights,
+            processor=processor,
+            seed=self.config.data.seed,
+            training=True,
+            num_shards_per_epoch=self.config.data.num_shards_per_epoch,
+            override_pretraining_statistics=self.config.data.override_pretraining_statistics,
+            weight_by_steps=weight_by_steps,
+        )

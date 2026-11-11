@@ -1,34 +1,27 @@
 """RLDX — RLWRLD RLDX-1 Vision-Language-Action model.
 
-Importing the package registers RLDX-1 with HuggingFace's ``AutoConfig``
-/ ``AutoModel`` / ``AutoProcessor`` registries, so the standard HF
-loading pattern works out of the box::
+Public symbols are exposed as lazy attributes (``rldx.RLDX``,
+``rldx.RLDXConfig``, ``rldx.RLDXProcessor``, ...), resolved on first access.
 
-    import rldx
-    from transformers import AutoConfig
-
-    cfg = AutoConfig.from_pretrained("RLWRLD/RLDX-1-PT")
-
-The public symbols are also exposed as lazy attributes (``rldx.RLDX``,
-``rldx.RLDXConfig``, ``rldx.RLDXProcessor``, ...) so that callers can
-reach the underlying classes without sub-module knowledge.
+Keep this file import-free. Python runs ``__init__.py`` before any sub-module,
+so an import here also reaches the sim venvs, which install ``rldx`` with
+``--no-deps`` and carry no model stack.
 """
 
 from importlib import import_module
 from typing import TYPE_CHECKING
 
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 _LAZY_ATTRS = {
     "Config": ("rldx.configs.base_config", "Config"),
     "RLDXConfig": ("rldx.configs.model.rldx", "RLDXConfig"),
-    "TrainConfig": ("rldx.configs.train_config", "TrainConfig"),
+    "TrainArgs": ("rldx.configs.training.cli", "TrainArgs"),
     "EmbodimentTag": ("rldx.data.embodiment_tags", "EmbodimentTag"),
-    "RLDXProcessor": ("rldx.model.core.processing_rldx", "RLDXProcessor"),
+    "RLDXProcessor": ("rldx.model.core.processor", "RLDXProcessor"),
     "RLDX": ("rldx.model.core.rldx", "RLDX"),
-    "RLDXPipeline": ("rldx.model.core.setup", "RLDXPipeline"),
-    "RLDXPolicy": ("rldx.policy.rldx_policy", "RLDXPolicy"),
+    "RLDXPolicy": ("rldx.serving.policy", "RLDXPolicy"),
 }
 
 
@@ -51,16 +44,8 @@ __all__ = ["__version__", *sorted(_LAZY_ATTRS)]
 if TYPE_CHECKING:
     from rldx.configs.base_config import Config
     from rldx.configs.model.rldx import RLDXConfig
-    from rldx.configs.train_config import TrainConfig
+    from rldx.configs.training.cli import TrainArgs
     from rldx.data.embodiment_tags import EmbodimentTag
-    from rldx.model.core.processing_rldx import RLDXProcessor
+    from rldx.model.core.processor import RLDXProcessor
     from rldx.model.core.rldx import RLDX
-    from rldx.model.core.setup import RLDXPipeline
-    from rldx.policy.rldx_policy import RLDXPolicy
-
-
-# Trigger HuggingFace auto-mapping registration for RLDX-1 on package
-# import. ``rldx.model.core.rldx`` runs ``AutoConfig.register("RLDX-1", ...)``
-# and ``AutoModel.register(...)``; ``rldx.model.core.processing_rldx`` runs
-# ``AutoProcessor.register(...)``.
-from rldx.model.core import processing_rldx as _processing_rldx, rldx as _rldx  # noqa: E402, F401
+    from rldx.serving.policy import RLDXPolicy

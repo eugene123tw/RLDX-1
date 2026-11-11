@@ -25,10 +25,25 @@ import numpy as np
 
 
 def stack_repeated(x, n, loc):
+    """
+    From Diffusion Policy, received via Isaac GR00T:
+    https://github.com/real-stanford/diffusion_policy, diffusion_policy/gym_util/multistep_wrapper.py
+
+    Copyright (c) 2023 Columbia Artificial Intelligence and Robotics Lab
+
+    Diffusion Policy is licensed under the MIT License; the full text is in NOTICE.
+    The other helpers in this module from the same upstream file refer here.
+    """
     return np.repeat(np.expand_dims(x, axis=loc), n, axis=loc)
 
 
 def repeated_box(box_space, n, loc):
+    """
+    From Diffusion Policy, received via Isaac GR00T:
+    https://github.com/real-stanford/diffusion_policy, diffusion_policy/gym_util/multistep_wrapper.py
+
+    See ``stack_repeated`` for the license.
+    """
     return spaces.Box(
         low=stack_repeated(box_space.low, n, loc),
         high=stack_repeated(box_space.high, n, loc),
@@ -38,6 +53,13 @@ def repeated_box(box_space, n, loc):
 
 
 def repeated_space(space, n, loc=0):
+    """
+    From Diffusion Policy, received via Isaac GR00T, which added the ``loc`` argument
+    here and in ``stack_repeated`` and ``repeated_box``, and the ``Text`` case:
+    https://github.com/real-stanford/diffusion_policy, diffusion_policy/gym_util/multistep_wrapper.py
+
+    See ``stack_repeated`` for the license.
+    """
     if isinstance(space, spaces.Box):
         return repeated_box(space, n, loc)
     elif isinstance(space, spaces.Dict):
@@ -54,12 +76,24 @@ def repeated_space(space, n, loc=0):
 
 
 def take_last_n(x, n):
+    """
+    From Diffusion Policy, received via Isaac GR00T:
+    https://github.com/real-stanford/diffusion_policy, diffusion_policy/gym_util/multistep_wrapper.py
+
+    See ``stack_repeated`` for the license.
+    """
     x = list(x)
     n = min(len(x), n)
     return np.array(x[-n:])
 
 
 def dict_take_last_n(x, n):
+    """
+    From Diffusion Policy, received via Isaac GR00T:
+    https://github.com/real-stanford/diffusion_policy, diffusion_policy/gym_util/multistep_wrapper.py
+
+    See ``stack_repeated`` for the license.
+    """
     result = dict()
     for key, value in x.items():
         result[key] = take_last_n(value, n)
@@ -122,6 +156,12 @@ def compress_dict_list(ds, recursive=False):
 
 
 def aggregate(data, method="max"):
+    """
+    From Diffusion Policy, received via Isaac GR00T:
+    https://github.com/real-stanford/diffusion_policy, diffusion_policy/gym_util/multistep_wrapper.py
+
+    See ``stack_repeated`` for the license.
+    """
     if method == "max":
         # equivalent to any
         return np.max(data)
@@ -137,6 +177,14 @@ def aggregate(data, method="max"):
 
 
 class MultiStepWrapper(gym.Wrapper):
+    """
+    From Diffusion Policy, received via Isaac GR00T, which rebuilt the observation
+    stacking around delta indices:
+    https://github.com/real-stanford/diffusion_policy, diffusion_policy/gym_util/multistep_wrapper.py
+
+    See ``stack_repeated`` for the license.
+    """
+
     def __init__(
         self,
         env,

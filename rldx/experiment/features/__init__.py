@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from rldx.configs.train_config import TrainConfig
+from rldx.configs.training.cli import TrainArgs
 from rldx.experiment.features.context import AssemblyContext
 from rldx.experiment.features.memory import MemoryFeature
 from rldx.experiment.features.motion import MossFeature
@@ -27,18 +27,13 @@ class FeatureModule(Protocol):
     """Other feature names that must be active simultaneously."""
 
     @staticmethod
-    def is_active(cli: TrainConfig) -> bool:
+    def is_active(cli: TrainArgs) -> bool:
         """Does this CLI activate this feature?"""
 
     @staticmethod
     def apply(ctx: AssemblyContext) -> None:
         """Mutate ctx.run_config directly for owned model/data fields;
         contribute to modality via ctx.add_anchors / ctx.add_strides."""
-
-    @staticmethod
-    def required_state_dict_prefixes() -> frozenset[str]:
-        """State_dict key prefixes this feature contributes to a checkpoint.
-        Used by CheckpointShape verification (spec §3.5; follow-up PR)."""
 
 
 FEATURES: tuple[type[FeatureModule], ...] = (

@@ -13,12 +13,12 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from rldx.configs.base_config import Config
-from rldx.configs.train_config import TrainConfig
+from rldx.configs.training.cli import TrainArgs
 
 
 @dataclass
 class AssemblyContext:
-    cli: TrainConfig
+    cli: TrainArgs
     run_config: Config
     _anchors: dict[tuple[str, str], set[int]] = field(default_factory=dict)
     _strides: dict[tuple[str, str], set[int]] = field(default_factory=dict)

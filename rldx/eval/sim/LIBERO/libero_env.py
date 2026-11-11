@@ -45,6 +45,9 @@ def quat2axisangle(quat):
     """
     Copied from robosuite: https://github.com/ARISE-Initiative/robosuite/blob/eafb81f54ffc104f905ee48a16bb15f059176ad3/robosuite/utils/transform_utils.py#L490C1-L512C55
 
+    robosuite is MIT-licensed:
+    Copyright (c) 2022 Stanford Vision and Learning Lab and UT Robot Perception and Learning Lab
+
     Converts quaternion to axis-angle format.
     Returns a unit vector direction scaled by its angle in radians.
 

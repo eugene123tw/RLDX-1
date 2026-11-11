@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from rldx.dist import rank_zero_print as _print
 from rldx.experiment.features.context import AssemblyContext
-from rldx.utils.dist import rank_zero_print as _print
 
 
 class MemoryFeature:
@@ -12,37 +12,19 @@ class MemoryFeature:
 
     @staticmethod
     def is_active(cli) -> bool:
-        return cli.use_memory
+        return cli.memory is not None
 
     @staticmethod
     def apply(ctx: AssemblyContext) -> None:
-        cli = ctx.cli
-        model = ctx.model
+        memory = ctx.cli.memory.to_config(ctx.model.memory)
+        ctx.model.memory = memory
 
-        model.use_memory = True
-        model.memory_length = cli.memory_length
-        model.memory_stride = cli.memory_stride
-        model.memory_n_cog_tokens = cli.memory_n_cog_tokens
-        model.concat_memory = cli.concat_memory
-        model.memory_dropout_prob = cli.memory_dropout_prob
-        if cli.memory_dropout_prob > 0.0:
-            assert cli.concat_memory, "memory_dropout_prob > 0.0 requires concat_memory=True"
-        if cli.blockwise_attn_for_memory:
-            model.memory_cfg["use_causal_attn"] = False
-
-        stride = cli.memory_stride
-        anchors = {-(cli.memory_length - 1 - i) * stride for i in range(cli.memory_length)}
+        anchors = {-(memory.length - 1 - i) * memory.stride for i in range(memory.length)}
         for emb_key in ctx.modality_configs:
             if "video" in ctx.modality_configs[emb_key]:
                 ctx.add_anchors(emb_key, "video", anchors)
-        ctx.data.allow_padding = True
 
         _print(
-            f"[i] use_memory: True, memory_length: {cli.memory_length}, "
-            f"memory_stride: {cli.memory_stride}, video_anchors: {sorted(anchors)}"
+            f"[i] memory: length {memory.length}, stride {memory.stride}, "
+            f"video_anchors: {sorted(anchors)}"
         )
-
-    @staticmethod
-    def required_state_dict_prefixes() -> frozenset[str]:
-        # Placeholder for CheckpointShape (T-C) in a follow-up PR
-        return frozenset()

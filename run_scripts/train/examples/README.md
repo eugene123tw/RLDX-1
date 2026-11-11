@@ -1,15 +1,17 @@
 # Training examples
 
-Reference scripts that build on `RLWRLD/RLDX-1-PT`:
+Reference scripts that build on `RLWRLD/RLDX-1.1-PT`:
 
 | Script | Purpose |
 |---|---|
-| [`finetune.sh`](finetune.sh) | Custom-dataset fine-tune template — vanilla video VLA on your LeRobot dataset(s). Toggle motion / memory / physics by uncommenting lines in the `ARGS` array. Supports both single-dataset (`--dataset-path`) and multi-dataset (`--dataset-paths` + `--dataset-mix-ratios`). |
-| [`midtrain_rldx1_droid.sh`](midtrain_rldx1_droid.sh) | Mid-train on the DROID dataset to produce `RLWRLD/RLDX-1-MT-DROID` (memory + motion + physics enabled). |
-| [`midtrain_rldx1_allex.sh`](midtrain_rldx1_allex.sh) | Mid-train on ALLEX humanoid data to produce `RLWRLD/RLDX-1-MT-ALLEX` (memory + motion + physics enabled). |
+| [`finetune.sh`](finetune.sh) | Custom-dataset fine-tune template — vanilla video VLA on your LeRobot dataset(s). Toggle motion / memory / physics by uncommenting lines in the `ARGS` array. Takes one dataset or several (`data:paths --data.paths …`, with optional `--data.mix-ratios`). |
+| [`midtrain_droid.sh`](midtrain_droid.sh) | Mid-train on the DROID dataset (memory + motion + physics enabled). |
+| [`midtrain_allex.sh`](midtrain_allex.sh) | Mid-train on ALLEX humanoid data (memory + motion + physics enabled). |
 
-The default `BASE_MODEL_PATH` for all three is `RLWRLD/RLDX-1-PT`;
+The default `BASE_MODEL_PATH` for all three is `RLWRLD/RLDX-1.1-PT`;
 override with `BASE_MODEL_PATH=<path>` to start from a different base.
+The RLDX-1 mid-trained checkpoints `RLWRLD/RLDX-1-MT-DROID` and
+`RLWRLD/RLDX-1-MT-ALLEX` still load as a base.
 
 ## Add-on CLI flags
 
@@ -18,14 +20,14 @@ default — uncomment to enable) and the mid-train scripts (always on):
 
 ```bash
 # Memory: cross-clip context tokens for long-horizon manipulation
---use-memory --memory-length 4 --memory-stride 16 --memory-n-cog-tokens 16 --concat-memory
+memory:on --memory.length 4 --memory.stride 16 --memory.n-cog-tokens 16 --memory.concat
 
 # Motion: discrete action-prefix tokens injected mid-backbone
---use-motion --motion-insert-layer 9
+motion:on --motion.insert-layer 9
 
-# Physics: per-step force/torque head; --physics-keys / --physics-dims
+# Physics: per-step force/torque head; --physics.keys / --physics.dims
 # must be aligned with your dataset's physics schema
---use-physics --physics-keys torque --physics-dims 48 --allow-missing-physics
+physics:on --physics.keys torque --physics.dims 48 --physics.allow-missing
 
 # Recommended whenever any add-on above is enabled — warms up the
 # newly-initialized weights for the first N steps
@@ -34,16 +36,13 @@ default — uncomment to enable) and the mid-train scripts (always on):
 
 ## Multi-dataset training (finetune.sh)
 
-`finetune.sh` accepts either a single LeRobot dataset root via
-`--dataset-path`, or multiple roots via `--dataset-paths` (with optional
-`--dataset-mix-ratios` for sampling weights). `--dataset-paths` takes
-precedence over `--dataset-path` at runtime, so you can leave the
-single-dataset line in place and just uncomment the multi-dataset line
-below it.
+`finetune.sh` gives its datasets with `data:paths --data.paths …`: one
+LeRobot dataset root, or several (with optional `--data.mix-ratios` for
+sampling weights), all of the `--data.embodiment-tag` embodiment.
 
-The mid-train scripts use a different dataset spec
-(`--pt-dataset-root` + `--pt-dataset-mix`, where the mix name is a
-preset registered in `rldx/configs/data/`).
+The mid-train scripts give theirs with `data:mix --data.root … --data.name …`,
+where the name is a mix registered in `rldx/configs/data/` that sets each
+dataset's embodiment and weight.
 
 ## Embodiment & modality config
 

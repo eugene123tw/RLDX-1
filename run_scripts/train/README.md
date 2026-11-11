@@ -1,15 +1,20 @@
 # RLDX Training Scripts
 
 The default `BASE_MODEL_PATH` for fine-tune scripts is
-`RLWRLD/RLDX-1-PT`; override with `BASE_MODEL_PATH=<path>` to start from a
+`RLWRLD/RLDX-1.1-PT`; override with `BASE_MODEL_PATH=<path>` to start from a
 different base.
+
+All four benchmark scripts also take
+`VARIANT=img`, which reproduces the image-input `RLWRLD/RLDX-1.1-FT-*-IMG`
+checkpoints: it starts from `RLWRLD/RLDX-1.1-PT-IMG` with `--video-length 1`
+and without `motion:on`.
 
 ## Directory layout
 
 | Directory | What's inside |
 |---|---|
-| [`benchmarks/`](benchmarks/) | One script per benchmark — the recipes that produced each released `RLWRLD/RLDX-1-FT-*` checkpoint (LIBERO, GR-1, RoboCasa, RoboCasa365, SIMPLER). |
-| [`examples/`](examples/) | Training recipes that produce `RLWRLD/RLDX-1-MT-*`, plus a [`finetune.sh`](examples/finetune.sh) template to copy + edit for fine-tuning on your own custom dataset. |
+| [`benchmarks/`](benchmarks/) | One script per benchmark — the recipes that produced each released `RLWRLD/RLDX-1.1-FT-*` checkpoint (LIBERO, GR-1, RoboCasa, RoboCasa365). |
+| [`examples/`](examples/) | Mid-training recipes (DROID, ALLEX), plus a [`finetune.sh`](examples/finetune.sh) template to copy + edit for fine-tuning on your own custom dataset. |
 
 ## Per-benchmark fine-tune
 
@@ -19,12 +24,10 @@ reference:
 
 | Benchmark | Script |
 |---|---|
-| LIBERO | `benchmarks/finetune_rldx1_libero.sh` |
-| GR-1 Tabletop | `benchmarks/finetune_rldx1_gr1.sh` |
-| RoboCasa Kitchen | `benchmarks/finetune_rldx1_robocasa.sh` |
-| RoboCasa365 | `benchmarks/finetune_rldx1_robocasa365.sh` |
-| SIMPLER Google | `benchmarks/finetune_rldx1_simpler_google.sh` |
-| SIMPLER WidowX | `benchmarks/finetune_rldx1_simpler_widowx.sh` |
+| LIBERO | `benchmarks/finetune_libero.sh` |
+| GR-1 Tabletop | `benchmarks/finetune_gr1.sh` |
+| RoboCasa Kitchen | `benchmarks/finetune_robocasa.sh` |
+| RoboCasa365 | `benchmarks/finetune_robocasa365.sh` |
 
 ## Fine-tune on your own dataset
 

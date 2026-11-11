@@ -16,7 +16,7 @@
 # This file has been modified from the original NVIDIA Isaac GR00T N1.7.
 # Original source: https://github.com/NVIDIA/Isaac-GR00T
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 import time
 
 import numpy as np
@@ -24,6 +24,7 @@ import torch.distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
 
 from rldx.data.interfaces import BaseProcessor, ShardedDataset
+from rldx.telemetry.train_metrics import LOADER_METRICS
 
 
 def merge_statistics(
@@ -175,6 +176,7 @@ class ShardedMixtureDataset(IterableDataset):
         training: bool = True,
         num_shards_per_epoch: int = int(1e5),
         override_pretraining_statistics: bool = False,
+        weight_by_steps: bool = False,
     ):
         """Initialize mixture dataset with datasets, weights, and configuration."""
         self.datasets = datasets
@@ -185,6 +187,13 @@ class ShardedMixtureDataset(IterableDataset):
         self.epoch = 0
         self.processor = processor
         self.override_pretraining_statistics = override_pretraining_statistics
+        # When True the per-shard ``avg_shard_size`` normalisation in
+        # :meth:`generate_shard_sampling_schedule` is bypassed: incoming
+        # ``weights`` are treated as length-baked sampling probabilities
+        # (``mix_ratio * len(dataset)`` set by ``DatasetFactory.build`` when
+        # ``--dataset-weight-by-steps`` is on), so picks land roughly in
+        # proportion to total step count.
+        self.weight_by_steps = weight_by_steps
 
         # Generate initial shard sampling schedule
         self.shard_sampling_schedule = self.generate_shard_sampling_schedule()
@@ -262,21 +271,49 @@ class ShardedMixtureDataset(IterableDataset):
                             for v in group_stats.values()
                         )
 
-                        rank_str = f"[Rank {self.rank}] " if hasattr(self, "rank") else ""
-                        ds_path = getattr(ds, "dataset_path", "unknown")
+                        ds_path = ds.dataset_path
 
                         if not all_zero:
                             print(
-                                f"{rank_str}[merge_statistics] INCLUDE emb={emb}, modality={modality}, ds={ds_path}, weight={w:.4f}"
+                                f"[merge_statistics] INCLUDE emb={emb}, modality={modality}, ds={ds_path}, weight={w:.4f}"
                             )
                             valid_stats.append(modality_stat)
                             valid_weights.append(w)
                         else:
                             print(
-                                f"{rank_str}[merge_statistics] SKIP (all-zero) emb={emb}, modality={modality}, ds={ds_path}"
+                                f"[merge_statistics] SKIP (all-zero) emb={emb}, modality={modality}, ds={ds_path}"
                             )
                     # ───────────────────────────────────────────────────────────────
 
+                    # State and action require normalization parameters, whereas
+                    # relative_action is legitimately absent for many tags. Limit
+                    # the all-zero fallback to the required modalities.
+                    if not valid_stats and modality in ("state", "action"):
+                        # If every contributing dataset is genuinely all-zero,
+                        # zero is the correct merged statistic. This occurs for
+                        # march_robocurate and roboturk state columns. The q99
+                        # normalizer masks zero-width ranges, avoiding division
+                        # by zero and leaving those coordinates at zero.
+                        fallback = [
+                            (s[modality], w)
+                            for s, w in zip(stats, weights_by_emb[emb])
+                            if modality in s
+                        ]
+                        if not fallback:
+                            print(
+                                f"[merge_statistics] No stats at all for emb={emb}, "
+                                f"modality={modality}, skipping"
+                            )
+                            continue
+                        valid_stats = [ms for ms, _ in fallback]
+                        valid_weights = [w for _, w in fallback]
+                        print(
+                            f"[merge_statistics] all-zero fallback emb={emb}, "
+                            f"modality={modality}, datasets={len(valid_stats)} "
+                            "(column is genuinely all-zero; keeping zero stats)"
+                        )
+
+                    # Optional modalities without statistics remain absent.
                     if not valid_stats:
                         print(
                             f"[merge_statistics] No valid stats for emb={emb}, modality={modality}, skipping"
@@ -317,18 +354,24 @@ class ShardedMixtureDataset(IterableDataset):
         if self.training:
             rng = np.random.default_rng(self.seed + self.epoch)
 
-            # Compute average shard sizes for normalization
-            average_shard_sizes = []
-            for dataset in self.datasets:
-                average_shard_size = sum(
-                    dataset.get_shard_length(i) for i in range(len(dataset))
-                ) / len(dataset)
-                average_shard_sizes.append(average_shard_size)
-
-            # Normalize weights by shard sizes to ensure fair sampling
-            normalized_weights = np.array(
-                [w / s for w, s in zip(self.weights, average_shard_sizes)]
-            )
+            # Default: equalise expected step contribution per shard pick by
+            # dividing the raw mix weights by avg_shard_size. This makes
+            # ``mix_ratio 1:1`` give equal step counts even when one dataset
+            # has shorter shards. Bypassed under ``weight_by_steps`` so the
+            # caller's length-baked weights survive intact (picks then land
+            # roughly in proportion to total step count).
+            if self.weight_by_steps:
+                normalized_weights = np.array(self.weights, dtype=float)
+            else:
+                average_shard_sizes = []
+                for dataset in self.datasets:
+                    average_shard_size = sum(
+                        dataset.get_shard_length(i) for i in range(len(dataset))
+                    ) / len(dataset)
+                    average_shard_sizes.append(average_shard_size)
+                normalized_weights = np.array(
+                    [w / s for w, s in zip(self.weights, average_shard_sizes)]
+                )
             normalized_weights = normalized_weights / normalized_weights.sum()
 
             # Sample datasets according to normalized weights
@@ -422,15 +465,18 @@ class ShardedMixtureDataset(IterableDataset):
         while True:
             self.curr_shard_index += 1
 
-            # Wait for background caching to complete
-            wait_start = time.time()
-            self.finish_cache_shard()
-            wait_end = time.time()
+            dataset_idx, _ = self.worker_shard_sampling_schedule[self.curr_shard_index]
+            dataset = self.datasets[dataset_idx]
+            dataset_label = str(dataset.dataset_path)
+            tag = f"rank={self.rank} worker={self.worker_id}"
 
-            dataset_index, shard_index = self.worker_shard_sampling_schedule[self.curr_shard_index]
-            print(
-                f"Rank {self.rank}, Worker {self.worker_id}: Wait for shard {shard_index} in dataset {dataset_index} in {wait_end - wait_start:.2f} seconds"
-            )
+            # Wait for background caching to complete. Accumulated into the
+            # loader window instead of printed per shard — the periodic
+            # summary (on_shard below) reports wait/build/decode together.
+            with LOADER_METRICS.training_scope():
+                with LOADER_METRICS.timed(LOADER_METRICS.shard_wait):
+                    self.finish_cache_shard(tag, dataset_label)
+            LOADER_METRICS.on_shard(tag, dataset=dataset_label)
 
             # Start caching next shard immediately
             self.cache_next_shard()
@@ -460,19 +506,32 @@ class ShardedMixtureDataset(IterableDataset):
             self.worker_shard_sampling_schedule = self.filter_shard_sample_schedule()
             self.curr_shard_index = -1
 
-        print(f"Rank {self.rank}, Worker {self.worker_id}: Caching shard...")
         next_dataset_idx, next_shard_idx = self.worker_shard_sampling_schedule[
             self.curr_shard_index + 1
         ]
         # Submit background loading job
-        self._cache_job = self._executor.submit(
-            self.datasets[next_dataset_idx].get_shard, next_shard_idx
-        )
+        self._cache_job = self._executor.submit(self._build_shard, next_dataset_idx, next_shard_idx)
 
-    def finish_cache_shard(self):
+    def _build_shard(self, dataset_idx: int, shard_idx: int) -> list:
+        """Build one shard, recording its cost. Runs on the prefetch thread,
+        so this timer sees the true build time even when it fully overlaps
+        compute — the wait window alone would under-report it."""
+        with LOADER_METRICS.training_scope():
+            with LOADER_METRICS.timed(LOADER_METRICS.shard_build):
+                return self.datasets[dataset_idx].get_shard(shard_idx)
+
+    def finish_cache_shard(self, tag: str, dataset: str):
         """Wait for the background caching job to complete and retrieve the shard."""
         assert self._cache_job is not None
-        self.curr_shard = self._cache_job.result()
+        started = time.perf_counter()
+        while True:
+            try:
+                # Bounded slices: a stall that outlives the process is only
+                # ever seen through the lines emitted while it is still going.
+                self.curr_shard = self._cache_job.result(timeout=LOADER_METRICS.stall_after)
+                break
+            except FutureTimeout:
+                LOADER_METRICS.on_stall(tag, time.perf_counter() - started, dataset=dataset)
         self._cache_job = None
 
     def delete_cached_shard(self):
@@ -494,38 +553,6 @@ class ShardedMixtureDataset(IterableDataset):
         self.curr_shard_index = -1
         self.curr_shard = None
         self._cache_job = None
-
-    def print_dataset_statistics(self):
-        """Print formatted dataset statistics for debugging and monitoring."""
-        print("=" * 100)
-        print("ShardedMixtureDataset Statistics")
-        print("=" * 100)
-
-        # Print header
-        print(f"{'Dataset Path':<60} {'Length':<10} {'Mix Ratio':<12}")
-        print("-" * 100)
-
-        # Print dataset details
-        for i, ds in enumerate(self.datasets):
-            dataset_path = str(ds.dataset_path)
-            # Truncate long paths for better display
-            if len(dataset_path) > 55:
-                dataset_path = "..." + dataset_path[-52:]
-
-            length = len(ds)
-            mix_ratio = self.weights[i] * 100
-
-            print(f"{dataset_path:<60} {length:<10,} {mix_ratio:<12.2f}")
-
-        # Print additional metadata
-        embodiments = set(
-            ds.embodiment_tag.value
-            for ds in self.datasets
-            if hasattr(ds, "embodiment_tag")  # type: ignore
-        )
-        print(f"Embodiments: {', '.join(sorted(embodiments))}")
-        print(f"Number of datasets: {len(self.datasets)}")
-        print("=" * 100)
 
     def get_initial_actions(self):
         """

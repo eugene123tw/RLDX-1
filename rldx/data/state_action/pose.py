@@ -16,11 +16,14 @@
 # This file has been modified from the original NVIDIA Isaac GR00T N1.7.
 # Original source: https://github.com/NVIDIA/Isaac-GR00T
 
+from __future__ import annotations
+
 from enum import Enum
 from typing import Optional, TypeVar, Union
 
 import numpy as np
 from numpy.typing import NDArray
+from rldx.data.types import ActionFormat
 from scipy.spatial.transform import Rotation
 
 
@@ -198,7 +201,6 @@ class JointPose(Pose):
 
         # Access individual joints
         first_joint = joint_pose.joints[0]
-        num_joints = joint_pose.num_joints
 
         # Compute relative joint displacement
         joint1 = JointPose([0.0, 0.5, 1.0])
@@ -235,16 +237,6 @@ class JointPose(Pose):
                 )
             self.joint_names = joint_names
 
-    @property
-    def num_joints(self) -> int:
-        """
-        Get the number of joints.
-
-        Returns:
-            Number of joints in the configuration
-        """
-        return len(self.joints)
-
     def to_dict(self) -> dict:
         """
         Convert joint configuration to dictionary.
@@ -276,7 +268,7 @@ class JointPose(Pose):
         relative_joints = self.joints - other.joints
         return JointPose(joints=relative_joints, joint_names=self.joint_names)
 
-    def copy(self) -> "JointPose":
+    def copy(self) -> JointPose:
         """
         Create a deep copy of this joint pose.
 
@@ -518,19 +510,9 @@ class EndEffectorPose(Pose):
         return self._translation.copy()
 
     @property
-    def quat_wxyz(self) -> np.ndarray:
-        """Get rotation as quaternion in wxyz order (w, x, y, z)"""
-        return self.to_rotation("quat", "wxyz")
-
-    @property
     def quat_xyzw(self) -> np.ndarray:
         """Get rotation as quaternion in xyzw order (x, y, z, w)"""
         return self.to_rotation("quat", "xyzw")
-
-    @property
-    def euler_xyz(self) -> np.ndarray:
-        """Get rotation as Euler angles in xyz order (degrees)"""
-        return self.to_rotation("euler", "xyz")
 
     @property
     def rotvec(self) -> np.ndarray:
@@ -579,7 +561,10 @@ class EndEffectorPose(Pose):
         return H
 
     def to_rotation(
-        self, rotation_type: str, rotation_order: Optional[str] = None, degrees: bool = True
+        self,
+        rotation_type: str,
+        rotation_order: Optional[str] = None,
+        degrees: bool = True,
     ) -> np.ndarray:
         """
         Get rotation in specified representation.
@@ -623,34 +608,6 @@ class EndEffectorPose(Pose):
         else:
             raise ValueError(f"Unknown rotation type: {rotation_type}")
 
-    def to_homogeneous(self) -> np.ndarray:
-        """
-        Convert pose to homogeneous transformation matrix.
-        (Alias for the homogeneous property)
-
-        Returns:
-            Homogeneous matrix - shape (4, 4)
-        """
-        return self.homogeneous
-
-    def set_rotation(
-        self,
-        rotation: Union[list, np.ndarray],
-        rotation_type: str,
-        rotation_order: Optional[str] = None,
-        degrees: bool = True,
-    ):
-        """
-        Set rotation from specified representation.
-
-        Args:
-            rotation: Rotation data
-            rotation_type: Type of rotation ("quat", "euler", "rotvec", "matrix", "rot6d")
-            rotation_order: Order/convention for the rotation type
-            degrees: For Euler angles, whether the input is in degrees (default True)
-        """
-        self._set_rotation(rotation, rotation_type, rotation_order, degrees)
-
     def _compute_relative(self, other):  # type: ignore[override]
         """
         Compute relative transformation from other to self.
@@ -674,7 +631,30 @@ class EndEffectorPose(Pose):
         # Create new EndEffectorPose from relative transformation
         return EndEffectorPose(homogeneous=T_relative)
 
-    def copy(self) -> "EndEffectorPose":
+    @classmethod
+    def from_action_format(cls, data: np.ndarray, action_format: ActionFormat) -> EndEffectorPose:
+        """
+        Create an EndEffectorPose from a flat array using the specified action format.
+
+        This is the inverse of the xyz_rot6d / xyz_rotvec / homogeneous properties.
+
+        Args:
+            data: Flat array whose layout depends on action_format.
+            action_format: One of ActionFormat.XYZ_ROT6D, XYZ_ROTVEC, or DEFAULT.
+
+        Returns:
+            EndEffectorPose instance.
+        """
+        if action_format == ActionFormat.XYZ_ROT6D:
+            return cls(translation=data[:3], rotation=data[3:], rotation_type="rot6d")
+        elif action_format == ActionFormat.XYZ_ROTVEC:
+            return cls(translation=data[:3], rotation=data[3:], rotation_type="rotvec")
+        elif action_format == ActionFormat.DEFAULT:
+            return cls(homogeneous=data.reshape(4, 4))
+        else:
+            raise ValueError(f"Unsupported ActionFormat: {action_format}")
+
+    def copy(self) -> EndEffectorPose:
         """
         Create a deep copy of this end-effector pose.
 

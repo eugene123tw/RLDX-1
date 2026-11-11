@@ -1,12 +1,11 @@
 """MSAT: Multi-Stream Action Transformer (top-level orchestrator).
 
 Submodules:
-- msat_attention.py: BasicTransformerBlock, SelfAttentionTransformer
 - msat_ops.py: RoPE, TimestepEncoder, SwiGLUFFN, head utilities
-- msat_blocks.py: Modulation, SingleStream, DoubleStream, Expanded, TripleStream blocks
+- msat_blocks.py: Modulation, SingleStream, DoubleStream, Expanded blocks
 """
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from diffusers import ConfigMixin, ModelMixin
 from diffusers.configuration_utils import register_to_config
@@ -14,10 +13,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from rldx.model.modules.action_model.attention import (
-    BasicTransformerBlock,
-    SelfAttentionTransformer,
-)
+# Re-export so callers can import ``_print`` from ``msat`` directly.
+from rldx.dist import rank_zero_print as _print
 from rldx.model.modules.action_model.blocks import (
     DoubleStreamBlock,
     ExpandedDoubleStreamBlock,
@@ -25,268 +22,26 @@ from rldx.model.modules.action_model.blocks import (
     Modulation,
     ModulationOut,
     SingleStreamBlock,
-    TripleStreamBlock,
 )
 from rldx.model.modules.action_model.ops import RoPEEmbedder1D, TimestepEncoder
-
-# Re-export so callers can import ``_print`` from ``msat`` directly.
-from rldx.utils.dist import rank_zero_print as _print
+from rldx.model.modules.action_model.padded_swiglu import PaddedSwiGLUFFN
+from rldx.model.modules.norms import adaptive_layer_norm
+from rldx.model.quantization.sites import LinearSite
 
 
 __all__ = [
-    "BasicTransformerBlock",
-    "SelfAttentionTransformer",
     "JointBase",
     "MSAT",
 ]
 
 
+class MSATOutput(NamedTuple):
+    action: torch.Tensor
+    physics: torch.Tensor | None
+
+
 class JointBase(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
-
-    def _build_double_blocks(
-        self,
-        depth,
-        sa_dim,
-        vl_dim,
-        num_heads,
-        head_dim,
-        dropout,
-        activation_fn,
-        attention_bias,
-        norm_eps,
-        qk_norm: str = "none",
-        use_swiglu: bool = False,
-        mlp_ratio: float = 4.0,
-        vl_mlp_ratio: Optional[float] = None,
-        positional_embeddings: Optional[str] = None,
-        max_seq_length: Optional[int] = None,
-        temb_type: str = "layerwise_mod",
-        remove_bias: bool = False,
-        pre_norm: str = "layer_norm",
-        post_norm: str = "none",
-    ):
-        return nn.ModuleList(
-            [
-                DoubleStreamBlock(
-                    sa_dim=sa_dim,
-                    vl_dim=vl_dim,
-                    num_attention_heads=num_heads,
-                    attention_head_dim=head_dim,
-                    mlp_ratio=mlp_ratio,
-                    vl_mlp_ratio=vl_mlp_ratio,
-                    dropout=dropout,
-                    activation_fn=activation_fn,
-                    attention_bias=attention_bias,
-                    norm_eps=norm_eps,
-                    qk_norm=qk_norm,
-                    use_swiglu=use_swiglu,
-                    positional_embeddings=positional_embeddings,
-                    max_seq_length=max_seq_length,
-                    temb_type=temb_type,
-                    remove_bias=remove_bias,
-                    pre_norm=pre_norm,
-                    post_norm=post_norm,
-                )
-                for _ in range(depth)
-            ]
-        )
-
-    def _build_triple_blocks(
-        self,
-        depth,
-        vl_dim,
-        sa_dim,
-        p_dim,
-        num_heads,
-        head_dim,
-        dropout,
-        activation_fn,
-        attention_bias,
-        norm_eps,
-        qk_norm: str = "none",
-        use_swiglu: bool = False,
-        mlp_ratio: float = 4.0,
-        vl_mlp_ratio: Optional[float] = None,
-        sa_mlp_ratio: Optional[float] = None,
-        p_mlp_ratio: Optional[float] = None,
-        positional_embeddings: Optional[str] = None,
-        max_seq_length: Optional[int] = None,
-        temb_type: str = "layerwise_mod",
-        remove_bias: bool = False,
-        pre_norm: str = "layer_norm",
-        post_norm: str = "none",
-    ):
-        return nn.ModuleList(
-            [
-                TripleStreamBlock(
-                    vl_dim=vl_dim,
-                    sa_dim=sa_dim,
-                    p_dim=p_dim,
-                    num_attention_heads=num_heads,
-                    attention_head_dim=head_dim,
-                    mlp_ratio=mlp_ratio,
-                    vl_mlp_ratio=vl_mlp_ratio,
-                    sa_mlp_ratio=sa_mlp_ratio,
-                    p_mlp_ratio=p_mlp_ratio,
-                    dropout=dropout,
-                    activation_fn=activation_fn,
-                    attention_bias=attention_bias,
-                    norm_eps=norm_eps,
-                    qk_norm=qk_norm,
-                    use_swiglu=use_swiglu,
-                    positional_embeddings=positional_embeddings,
-                    max_seq_length=max_seq_length,
-                    temb_type=temb_type,
-                    remove_bias=remove_bias,
-                    pre_norm=pre_norm,
-                    post_norm=post_norm,
-                )
-                for _ in range(depth)
-            ]
-        )
-
-    def _build_single_blocks(
-        self,
-        depth,
-        hidden_size,
-        num_heads,
-        head_dim,
-        dropout,
-        activation_fn,
-        attention_bias,
-        norm_eps,
-        qk_norm: str = "none",
-        use_swiglu: bool = False,
-        mlp_ratio: float = 4.0,
-        positional_embeddings: Optional[str] = None,
-        max_seq_length: Optional[int] = None,
-        temb_type: str = "layerwise_mod",
-        remove_bias: bool = False,
-        pre_norm: str = "layer_norm",
-        post_norm: str = "none",
-    ):
-        return nn.ModuleList(
-            [
-                SingleStreamBlock(
-                    hidden_size=hidden_size,
-                    num_attention_heads=num_heads,
-                    attention_head_dim=head_dim,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                    activation_fn=activation_fn,
-                    attention_bias=attention_bias,
-                    norm_eps=norm_eps,
-                    qk_norm=qk_norm,
-                    use_swiglu=use_swiglu,
-                    positional_embeddings=positional_embeddings,
-                    max_seq_length=max_seq_length,
-                    temb_type=temb_type,
-                    remove_bias=remove_bias,
-                    pre_norm=pre_norm,
-                    post_norm=post_norm,
-                )
-                for _ in range(depth)
-            ]
-        )
-
-    def _build_expanded_double_blocks(
-        self,
-        depth,
-        sa_dim,
-        vl_dim,
-        p_dim,
-        num_heads,
-        head_dim,
-        dropout,
-        activation_fn,
-        attention_bias,
-        norm_eps,
-        qk_norm="none",
-        use_swiglu=False,
-        mlp_ratio=4.0,
-        vl_mlp_ratio=None,
-        p_mlp_ratio=None,
-        positional_embeddings=None,
-        max_seq_length=None,
-        temb_type="layerwise_mod",
-        remove_bias=False,
-        pre_norm="layer_norm",
-        post_norm="none",
-    ):
-        return nn.ModuleList(
-            [
-                ExpandedDoubleStreamBlock(
-                    sa_dim=sa_dim,
-                    vl_dim=vl_dim,
-                    p_dim=p_dim,
-                    num_attention_heads=num_heads,
-                    attention_head_dim=head_dim,
-                    mlp_ratio=mlp_ratio,
-                    vl_mlp_ratio=vl_mlp_ratio,
-                    p_mlp_ratio=p_mlp_ratio,
-                    dropout=dropout,
-                    activation_fn=activation_fn,
-                    attention_bias=attention_bias,
-                    norm_eps=norm_eps,
-                    qk_norm=qk_norm,
-                    use_swiglu=use_swiglu,
-                    positional_embeddings=positional_embeddings,
-                    max_seq_length=max_seq_length,
-                    temb_type=temb_type,
-                    remove_bias=remove_bias,
-                    pre_norm=pre_norm,
-                    post_norm=post_norm,
-                )
-                for _ in range(depth)
-            ]
-        )
-
-    def _build_expanded_single_blocks(
-        self,
-        depth,
-        hidden_size,
-        p_dim,
-        num_heads,
-        head_dim,
-        dropout,
-        activation_fn,
-        attention_bias,
-        norm_eps,
-        qk_norm="none",
-        use_swiglu=False,
-        mlp_ratio=4.0,
-        positional_embeddings=None,
-        max_seq_length=None,
-        temb_type="layerwise_mod",
-        remove_bias=False,
-        pre_norm="layer_norm",
-        post_norm="none",
-    ):
-        return nn.ModuleList(
-            [
-                ExpandedSingleStreamBlock(
-                    hidden_size=hidden_size,
-                    p_dim=p_dim,
-                    num_attention_heads=num_heads,
-                    attention_head_dim=head_dim,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                    activation_fn=activation_fn,
-                    attention_bias=attention_bias,
-                    norm_eps=norm_eps,
-                    qk_norm=qk_norm,
-                    use_swiglu=use_swiglu,
-                    positional_embeddings=positional_embeddings,
-                    max_seq_length=max_seq_length,
-                    temb_type=temb_type,
-                    remove_bias=remove_bias,
-                    pre_norm=pre_norm,
-                    post_norm=post_norm,
-                )
-                for _ in range(depth)
-            ]
-        )
 
     def _forward_inner(
         self,
@@ -301,7 +56,7 @@ class JointBase(ModelMixin, ConfigMixin):
         """
         Forward pass for MSAT.
             - sa_embs: (B, N_sa, sa_dim) - concatenated state+action
-            - vl_embs: (B, N_vl, vl_dim) - VL tokens (may include cognition tokens if use_cog_tokens=True)
+            - vl_embs: (B, N_vl, vl_dim) - backbone features (cognition tokens, after the VL tokens when cog_mode='full')
             - physics_embs: (B, N_p, sa_dim) - physics signal tokens (only when use_physics=True)
             - physics_attention_mask: (B,) - per-sample physics mask (1=visible, 0=masked)
         """
@@ -318,9 +73,6 @@ class JointBase(ModelMixin, ConfigMixin):
             time_token = t_emb.repeat(1, self.num_temb_tokens, 1)
             has_time_token = True
 
-        # Track VL length for Single Stream Block RoPE calculation
-        N_vl_for_single = None
-
         # Generate Shared Modulations
         shared_modulations = None
         shared_single_modulation = None
@@ -334,439 +86,144 @@ class JointBase(ModelMixin, ConfigMixin):
                 "vl_mod2_raw": vl_mod2_raw,
             }
             shared_single_mod_raw, _ = self.shared_single_mod(temb)
-            if hasattr(self, "shared_single_mod_proj"):
-                shared_single_modulation = ModulationOut(
-                    shift=self.shared_single_mod_proj(shared_single_mod_raw.shift),
-                    scale=self.shared_single_mod_proj(shared_single_mod_raw.scale),
-                    gate=self.shared_single_mod_proj(shared_single_mod_raw.gate),
-                )
-            else:
-                shared_single_modulation = shared_single_mod_raw
+            shared_single_modulation = ModulationOut(
+                shift=self.shared_single_mod_proj(shared_single_mod_raw.shift),
+                scale=self.shared_single_mod_proj(shared_single_mod_raw.scale),
+                gate=self.shared_single_mod_proj(shared_single_mod_raw.gate),
+            )
 
+        if self.use_physics != (physics_embs is not None):
+            raise ValueError(
+                f"MSAT built with use_physics={self.use_physics} cannot take "
+                f"physics_embs={'a tensor' if physics_embs is not None else None}"
+            )
         sa, vl = sa_embs.contiguous(), vl_embs.contiguous()
+        p = None if physics_embs is None else physics_embs.contiguous()
+        n_p = 0 if p is None else p.shape[1]
 
-        # ══════════════════════════════════════════════════════════════════════
-        # Physics-enabled path: ExpandedDouble [VL | SA | P] -> ExpandedSingle [VL+SA | P]
-        # ══════════════════════════════════════════════════════════════════════
-        if self.use_physics and physics_embs is not None:
-            return self._forward_physics(
-                sa,
-                vl,
-                physics_embs,
-                temb,
-                time_token,
-                has_time_token,
-                return_all_hidden_states,
-                shared_modulations,
-                shared_single_modulation,
-                encoder_attention_mask,
-                physics_attention_mask,
-            )
-
-        # ══════════════════════════════════════════════════════════════════════
-        # Standard path: DoubleStreamBlocks [VL | SA] -> SingleStreamBlocks [VL_proj | SA]
-        # ══════════════════════════════════════════════════════════════════════
-
-        # Prepend time_token to SA: [time_token | S | A]
+        # Lower: DoubleStreamBlocks [VL | time | S | A (| P)]
         if has_time_token:
             sa = torch.cat([time_token, sa], dim=1)
-
+        n_time = self.num_temb_tokens if has_time_token else 0
         all_hidden = [sa]
 
         pe = None
         if self.use_rope:
-            B, N_vl = vl.shape[0], vl.shape[1]
-            N_sa_total = sa.shape[1]
-            device = sa.device
+            n_body = sa.shape[1] - n_time
+            first = n_time + (self.positional_embeddings == "rope_vl_sa")
+            pe = self.rope_embedder(
+                self._position_ids(sa.shape[0], vl.shape[1], n_time, n_body, first, n_p, sa.device)
+            )
 
-            total_len = N_vl + N_sa_total
-            ids = torch.zeros(B, total_len, 2, dtype=torch.long, device=device)
-            sa_stream_start_idx = N_vl
-
-            if self.positional_embeddings == "rope_sa_only":
-                # Position ID assignment: (time_token) | S | A
-                current_idx = sa_stream_start_idx
-                if has_time_token:
-                    # Time token: axis 1 = 0..num_temb_tokens-1
-                    ids[:, current_idx : current_idx + self.num_temb_tokens, 1] = (
-                        torch.arange(self.num_temb_tokens, device=device).unsqueeze(0).expand(B, -1)
-                    )
-                    current_idx += self.num_temb_tokens
-                # SA tokens (S | A): axis 1 = starting from (num_temb_tokens)
-                sa_len = N_sa_total - (self.num_temb_tokens if has_time_token else 0)
-                start_pos = self.num_temb_tokens if has_time_token else 0
-                ids[:, current_idx:, 1] = (
-                    torch.arange(start_pos, start_pos + sa_len, device=device)
-                    .unsqueeze(0)
-                    .expand(B, -1)
-                )
-            elif self.positional_embeddings == "rope_vl_sa":
-                ids[:, :N_vl, 0] = torch.arange(N_vl, device=device).unsqueeze(0).expand(B, -1)
-                # Position ID assignment: (time_token) | S | A
-                current_idx = sa_stream_start_idx
-                if has_time_token:
-                    # Time token: axis 1 = 0..num_temb_tokens-1
-                    ids[:, current_idx : current_idx + self.num_temb_tokens, 1] = (
-                        torch.arange(self.num_temb_tokens, device=device).unsqueeze(0).expand(B, -1)
-                    )
-                    current_idx += self.num_temb_tokens
-                # SA tokens (S | A): axis 1 = starting from (num_temb_tokens)
-                sa_len = N_sa_total - (self.num_temb_tokens if has_time_token else 0)
-                start_pos = (self.num_temb_tokens if has_time_token else 0) + 1
-                ids[:, current_idx:, 1] = (
-                    torch.arange(start_pos, start_pos + sa_len, device=device)
-                    .unsqueeze(0)
-                    .expand(B, -1)
-                )
-
-            pe = self.rope_embedder(ids)
-
-        # Track block index
         block_idx = 0
         for blk in self.double_blocks:
-            sa, vl = blk(
-                sa,
-                vl,
-                temb,
+            stream = dict(
                 pe=pe,
                 shared_modulations=shared_modulations,
                 has_time_token=has_time_token,
                 block_idx=block_idx,
                 encoder_attention_mask=encoder_attention_mask,
             )
+            if p is None:
+                sa, vl = blk(sa, vl, temb, **stream)
+            else:
+                sa, vl, p = blk(
+                    sa,
+                    vl,
+                    temb,
+                    **stream,
+                    p_tokens=p,
+                    physics_attention_mask=physics_attention_mask,
+                )
             all_hidden.append(sa)
             block_idx += 1
 
-        # Separate time_token before single stream block
         if has_time_token:
             time_token = sa[:, : self.num_temb_tokens, :]
             sa = sa[:, self.num_temb_tokens :, :]
 
+        # Upper: SingleStreamBlocks [VL' | time | S | A (| P)]
         if len(self.single_blocks) > 0:
+            n_vl = vl.shape[1]
             vl_projected = self.vl_proj_to_sa(vl)
-            N_vl_for_single = vl.shape[
-                1
-            ]  # Track VL length for Single Stream Block RoPE calculation
-
-            # Re-concat with updated time_token: VL | (time_token) | S | A
             if has_time_token:
                 x = torch.cat([vl_projected, time_token, sa], dim=1)
             else:
                 x = torch.cat([vl_projected, sa], dim=1)
 
-        # Single Stream Blocks
-        if len(self.single_blocks) > 0:
             pe_single = None
             if self.use_rope:
-                B_single = x.shape[0]
-                N_total = x.shape[1]
-                device_single = x.device
-
-                N_action_pure = sa.shape[1]
-                action_start_idx_in_x = N_total - N_action_pure
-
-                # 2D RoPE
-                ids_single = torch.zeros(
-                    B_single, N_total, 2, dtype=torch.long, device=device_single
-                )
-
-                if self.positional_embeddings == "rope_sa_only":
-                    current_idx = N_vl_for_single
-                    if has_time_token:
-                        # Time token: axis 1 = 0..num_temb_tokens-1
-                        ids_single[:, current_idx : current_idx + self.num_temb_tokens, 1] = (
-                            torch.arange(self.num_temb_tokens, device=device_single)
-                            .unsqueeze(0)
-                            .expand(B_single, -1)
-                        )
-                        current_idx += self.num_temb_tokens
-                    # Action positions: axis 1 = sequence position starting from (num_temb_tokens)
-                    start_pos = (self.num_temb_tokens if has_time_token else 0) + 1
-                    ids_single[:, action_start_idx_in_x:, 1] = (
-                        torch.arange(start_pos, start_pos + N_action_pure, device=device_single)
-                        .unsqueeze(0)
-                        .expand(B_single, -1)
+                pe_single = self.rope_embedder(
+                    self._position_ids(
+                        x.shape[0], n_vl, n_time, sa.shape[1], n_time + 1, n_p, x.device
                     )
-                elif self.positional_embeddings == "rope_vl_sa":
-                    # VL positions: axis 0 = sequence position
-                    ids_single[:, :N_vl_for_single, 0] = (
-                        torch.arange(N_vl_for_single, device=device_single)
-                        .unsqueeze(0)
-                        .expand(B_single, -1)
-                    )
-                    # Context tokens: (time_token) | S | A
-                    current_idx = N_vl_for_single
-                    if has_time_token:
-                        # Time token: axis 1 = 0..num_temb_tokens-1
-                        ids_single[:, current_idx : current_idx + self.num_temb_tokens, 1] = (
-                            torch.arange(self.num_temb_tokens, device=device_single)
-                            .unsqueeze(0)
-                            .expand(B_single, -1)
-                        )
-                        current_idx += self.num_temb_tokens
-                    # Action positions: axis 1 = sequence position starting from (num_temb_tokens)
-                    start_pos = (self.num_temb_tokens if has_time_token else 0) + 1
-                    ids_single[:, action_start_idx_in_x:, 1] = (
-                        torch.arange(start_pos, start_pos + N_action_pure, device=device_single)
-                        .unsqueeze(0)
-                        .expand(B_single, -1)
-                    )
-
-                pe_single = self.rope_embedder(ids_single)
-
-            # Build single-stream attention mask from encoder_attention_mask
-            single_attn_mask = None
-            if encoder_attention_mask is not None:
-                B_mask = x.shape[0]
-                N_x = x.shape[1]
-                N_vl_mask = N_vl_for_single
-                N_rest = N_x - N_vl_mask
-                rest_mask = torch.ones(
-                    B_mask, N_rest, device=x.device, dtype=encoder_attention_mask.dtype
-                )
-                kv_mask = torch.cat([encoder_attention_mask, rest_mask], dim=1)  # [B, N_x]
-                single_attn_mask = kv_mask[:, None, None, :]  # [B, 1, 1, N_x]
-                single_attn_mask = torch.where(
-                    single_attn_mask == 0,
-                    torch.tensor(float("-inf"), device=x.device, dtype=x.dtype),
-                    torch.tensor(0.0, device=x.device, dtype=x.dtype),
                 )
 
-            # block_idx already tracks the number of DoubleStreamBlocks processed
-            for blk in self.single_blocks:
-                x = blk(
-                    x,
-                    temb,
-                    pe=pe_single if pe_single is not None else pe,
-                    shared_modulation=shared_single_modulation,
-                    time_token=time_token if has_time_token else None,
-                    block_idx=block_idx,
-                    attn_mask=single_attn_mask,
-                )
-                block_idx += 1
-
-            # Extract Action Part
-            N_action_pure = sa.shape[1]
-            sa = x[:, -N_action_pure:, :]
-
-        out = self._output_projection(sa, temb)
-
-        if return_all_hidden_states:
-            return out, all_hidden
-        return out
-
-    def _forward_physics(
-        self,
-        sa,
-        vl,
-        p_embs,
-        temb,
-        time_token,
-        has_time_token,
-        return_all_hidden_states,
-        shared_modulations,
-        shared_single_modulation,
-        encoder_attention_mask,
-        physics_attention_mask=None,
-    ):
-        """
-        Physics-enabled forward:
-          Lower: ExpandedDoubleStreamBlocks [VL | SA | P] (3-way via p_tokens kwarg)
-          Upper: ExpandedSingleStreamBlocks [VL+SA | P] (2-way via p_tokens kwarg)
-        """
-        p = p_embs.contiguous()
-
-        # Prepend time_token to SA only (physics stream is not diffusion-based)
-        if has_time_token:
-            sa = torch.cat([time_token, sa], dim=1)
-
-        all_hidden = [sa]
-
-        # ── RoPE for lower blocks: [VL | SA | P] ────────────────────────
-        pe = None
-        if self.use_rope:
-            B = sa.shape[0]
-            N_vl = vl.shape[1]
-            N_sa = sa.shape[1]
-            N_p = p.shape[1]
-            device = sa.device
-
-            total_len = N_vl + N_sa + N_p
-            ids = torch.zeros(B, total_len, 2, dtype=torch.long, device=device)
-            sa_start = N_vl
-
-            # Sequence layout: [VL (N_vl) | SA (N_sa) | P (N_p)]
-            p_start = N_vl + N_sa
-
-            if self.positional_embeddings == "rope_sa_only":
-                # SA positions on axis1
-                current_idx = sa_start
-                if has_time_token:
-                    ids[:, current_idx : current_idx + self.num_temb_tokens, 1] = (
-                        torch.arange(self.num_temb_tokens, device=device).unsqueeze(0).expand(B, -1)
-                    )
-                    current_idx += self.num_temb_tokens
-                sa_len = N_sa - (self.num_temb_tokens if has_time_token else 0)
-                start_pos = self.num_temb_tokens if has_time_token else 0
-                ids[:, current_idx : current_idx + sa_len, 1] = (
-                    torch.arange(start_pos, start_pos + sa_len, device=device)
-                    .unsqueeze(0)
-                    .expand(B, -1)
-                )
-                # P positions: axis0=1 (distinguish from SA), axis1=sequential
-                ids[:, p_start:, 0] = 1
-                ids[:, p_start:, 1] = torch.arange(N_p, device=device).unsqueeze(0).expand(B, -1)
-            elif self.positional_embeddings == "rope_vl_sa":
-                ids[:, :N_vl, 0] = torch.arange(N_vl, device=device).unsqueeze(0).expand(B, -1)
-                # SA positions on axis1
-                current_idx = sa_start
-                if has_time_token:
-                    ids[:, current_idx : current_idx + self.num_temb_tokens, 1] = (
-                        torch.arange(self.num_temb_tokens, device=device).unsqueeze(0).expand(B, -1)
-                    )
-                    current_idx += self.num_temb_tokens
-                sa_len = N_sa - (self.num_temb_tokens if has_time_token else 0)
-                start_pos = (self.num_temb_tokens if has_time_token else 0) + 1
-                ids[:, current_idx : current_idx + sa_len, 1] = (
-                    torch.arange(start_pos, start_pos + sa_len, device=device)
-                    .unsqueeze(0)
-                    .expand(B, -1)
-                )
-                # P positions: axis0=1 (distinguish from SA/VL), axis1=sequential
-                ids[:, p_start:, 0] = 1
-                ids[:, p_start:, 1] = torch.arange(N_p, device=device).unsqueeze(0).expand(B, -1)
-
-            pe = self.rope_embedder(ids)
-
-        # ── Lower: Triple blocks [VL | SA | P] ───────────────────────────
-        block_idx = 0
-        for blk in self.double_blocks:
-            sa, vl, p = blk(
-                sa,
-                vl,
-                temb,
-                pe=pe,
-                shared_modulations=shared_modulations,
-                has_time_token=has_time_token,
-                block_idx=block_idx,
-                encoder_attention_mask=encoder_attention_mask,
-                p_tokens=p,
-                physics_attention_mask=physics_attention_mask,
+            single_attn_mask = self._single_padding_mask(
+                x, n_vl, n_p, encoder_attention_mask, physics_attention_mask
             )
-            all_hidden.append(sa)
-            block_idx += 1
-
-        # Strip time tokens from SA
-        if has_time_token:
-            time_token = sa[:, : self.num_temb_tokens, :]
-            sa = sa[:, self.num_temb_tokens :, :]
-
-        # ── Upper: ExpandedSingleStreamBlocks with p_tokens ───────────────
-        if len(self.single_blocks) > 0:
-            vl_projected = self.vl_proj_to_sa(vl)
-            N_vl_for_single = vl.shape[1]
-            if has_time_token:
-                x = torch.cat([vl_projected, time_token, sa], dim=1)
-            else:
-                x = torch.cat([vl_projected, sa], dim=1)
-
-            # RoPE for upper blocks: [SA+VL (N_x) | P (N_p)]
-            pe_single = None
-            if self.use_rope:
-                B_s = x.shape[0]
-                N_x = x.shape[1]
-                N_p = p.shape[1]
-                ids_s = torch.zeros(B_s, N_x + N_p, 2, dtype=torch.long, device=x.device)
-
-                if self.positional_embeddings in ("rope_sa_only", "rope_vl_sa"):
-                    # SA+VL stream positions (same as standard SingleStreamBlock RoPE)
-                    if self.positional_embeddings == "rope_vl_sa":
-                        ids_s[:, :N_vl_for_single, 0] = (
-                            torch.arange(N_vl_for_single, device=x.device)
-                            .unsqueeze(0)
-                            .expand(B_s, -1)
-                        )
-                    current_idx = N_vl_for_single
-                    if has_time_token:
-                        ids_s[:, current_idx : current_idx + self.num_temb_tokens, 1] = (
-                            torch.arange(self.num_temb_tokens, device=x.device)
-                            .unsqueeze(0)
-                            .expand(B_s, -1)
-                        )
-                        current_idx += self.num_temb_tokens
-                    sa_pure_len = sa.shape[1]
-                    start_pos = (self.num_temb_tokens if has_time_token else 0) + 1
-                    ids_s[:, current_idx : current_idx + sa_pure_len, 1] = (
-                        torch.arange(start_pos, start_pos + sa_pure_len, device=x.device)
-                        .unsqueeze(0)
-                        .expand(B_s, -1)
-                    )
-
-                    # P stream positions: axis0=1 (distinguish from SA+VL), axis1=sequential
-                    p_section_start = N_x
-                    ids_s[:, p_section_start:, 0] = 1
-                    ids_s[:, p_section_start:, 1] = (
-                        torch.arange(N_p, device=x.device).unsqueeze(0).expand(B_s, -1)
-                    )
-
-                pe_single = self.rope_embedder(ids_s)
-
-            # Build single-stream attention mask covering [VL+SA | P]
-            single_attn_mask = None
-            if encoder_attention_mask is not None or physics_attention_mask is not None:
-                B_mask = x.shape[0]
-                N_x_mask = x.shape[1]
-                N_p_mask = p.shape[1]
-                # VL+SA part
-                if encoder_attention_mask is not None:
-                    N_vl_mask = N_vl_for_single
-                    rest_mask_x = torch.ones(
-                        B_mask,
-                        N_x_mask - N_vl_mask,
-                        device=x.device,
-                        dtype=encoder_attention_mask.dtype,
-                    )
-                    x_mask = torch.cat([encoder_attention_mask, rest_mask_x], dim=1)
-                else:
-                    x_mask = torch.ones(B_mask, N_x_mask, device=x.device, dtype=x.dtype)
-                # P part
-                if physics_attention_mask is not None:
-                    p_mask = (
-                        physics_attention_mask[:, None].expand(-1, N_p_mask).to(dtype=x_mask.dtype)
-                    )
-                else:
-                    p_mask = torch.ones(B_mask, N_p_mask, device=x.device, dtype=x_mask.dtype)
-                kv_mask = torch.cat([x_mask, p_mask], dim=1)
-                single_attn_mask = kv_mask[:, None, None, :]
-                single_attn_mask = torch.where(
-                    single_attn_mask == 0,
-                    torch.tensor(float("-inf"), device=x.device, dtype=x.dtype),
-                    torch.tensor(0.0, device=x.device, dtype=x.dtype),
-                )
 
             for blk in self.single_blocks:
-                x, p = blk(
-                    x,
-                    temb,
+                stream = dict(
                     pe=pe_single,
                     shared_modulation=shared_single_modulation,
                     time_token=time_token if has_time_token else None,
                     block_idx=block_idx,
-                    p_tokens=p,
                     attn_mask=single_attn_mask,
                 )
+                if p is None:
+                    x = blk(x, temb, **stream)
+                else:
+                    x, p = blk(x, temb, **stream, p_tokens=p)
                 block_idx += 1
 
             sa = x[:, -sa.shape[1] :, :]
 
-        # ── Output projections ────────────────────────────────────────────
-        action_out = self._output_projection(sa, temb)
-        physics_out = self._output_projection_physics(p, temb)
-
-        out = {"action": action_out, "physics": physics_out}
+        out = MSATOutput(
+            self._output_projection(sa, temb),
+            None if p is None else self._output_projection_physics(p, temb),
+        )
         if return_all_hidden_states:
             return out, all_hidden
         return out
+
+    def _position_ids(self, batch, n_vl, n_time, n_body, first, n_p, device):
+        """RoPE ids over [VL | time | body | P]: VL on axis 0 (rope_vl_sa only), time and body
+        on axis 1 with the body starting at ``first``, P on axis 1 with axis 0 set to 1."""
+        ids = torch.zeros(batch, n_vl + n_time + n_body + n_p, 2, dtype=torch.long, device=device)
+        if self.positional_embeddings == "rope_vl_sa":
+            ids[:, :n_vl, 0] = torch.arange(n_vl, device=device)
+        body = n_vl + n_time
+        ids[:, n_vl:body, 1] = torch.arange(n_time, device=device)
+        ids[:, body : body + n_body, 1] = torch.arange(first, first + n_body, device=device)
+        ids[:, body + n_body :, 0] = 1
+        ids[:, body + n_body :, 1] = torch.arange(n_p, device=device)
+        return ids
+
+    @staticmethod
+    def _single_padding_mask(x, n_vl, n_p, encoder_attention_mask, physics_attention_mask):
+        if encoder_attention_mask is None and physics_attention_mask is None:
+            return None
+        batch, n_x = x.shape[:2]
+        if encoder_attention_mask is not None:
+            rest = torch.ones(
+                batch, n_x - n_vl, device=x.device, dtype=encoder_attention_mask.dtype
+            )
+            kv_mask = torch.cat([encoder_attention_mask, rest], dim=1)
+        else:
+            kv_mask = torch.ones(batch, n_x, device=x.device, dtype=x.dtype)
+        if n_p:
+            if physics_attention_mask is not None:
+                p_mask = physics_attention_mask[:, None].expand(-1, n_p).to(dtype=kv_mask.dtype)
+            else:
+                p_mask = torch.ones(batch, n_p, device=x.device, dtype=kv_mask.dtype)
+            kv_mask = torch.cat([kv_mask, p_mask], dim=1)
+        kv_mask = kv_mask[:, None, None, :]
+        return torch.where(
+            kv_mask == 0,
+            torch.tensor(float("-inf"), device=x.device, dtype=x.dtype),
+            torch.tensor(0.0, device=x.device, dtype=x.dtype),
+        )
 
     def _output_projection_physics(self, p, temb):
         """Physics output projection with AdaLN-zero style."""
@@ -777,8 +234,17 @@ class JointBase(ModelMixin, ConfigMixin):
     def _output_projection(self, sa, temb):
         """Output projection with AdaLN-zero style."""
         shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=1)
-        sa = self.norm_out(sa) * (1 + scale[:, None]) + shift[:, None]
+        sa = adaptive_layer_norm(self.norm_out, sa, scale[:, None], shift[:, None])
         return self.proj_out_2(sa)
+
+
+def _stream_sites(group, block, stream):
+    for name in ("qkv", "proj"):
+        yield LinearSite(group, block, f"{stream}_{name}")
+    mlp = getattr(block, f"{stream}_mlp")
+    if isinstance(mlp, PaddedSwiGLUFFN):
+        yield LinearSite(group, mlp, "w12")
+        yield LinearSite(group, mlp, "w3", elementwise_input=True)
 
 
 class MSAT(JointBase):
@@ -786,15 +252,27 @@ class MSAT(JointBase):
     Flux-style MSAT with DoubleStreamBlock + SingleStreamBlock architecture.
     """
 
+    def quantization_sites(self):
+        for block in self.double_blocks:
+            yield from _stream_sites("msat_vl", block, "vl")
+            yield from _stream_sites("msat_sa", block, "sa")
+        if not isinstance(self.vl_proj_to_sa, nn.Identity):
+            yield LinearSite("msat_vl", self, "vl_proj_to_sa")
+        for block in self.single_blocks:
+            for name in ("linear1", "linear2", "mlp_proj"):
+                if getattr(block, name) is not None:
+                    yield LinearSite("msat_sa", block, name)
+
     @register_to_config
     def __init__(
         self,
         num_attention_heads: int = 8,
         attention_head_dim: int = 64,
         output_dim: int = 26,
-        depth_multi_stream: int = 12,  # Number of DoubleStreamBlocks (or TripleStreamBlocks)
+        depth_multi_stream: int = 12,  # Number of DoubleStreamBlocks
         depth_single_stream: int = 0,  # Number of SingleStreamBlocks (Flux style)
         dropout: float = 0.1,
+        attn_dropout: float = 0.0,
         attention_bias: Optional[bool] = None,  # If None, defaults to True
         activation_fn: str = "gelu-approximate",
         norm_eps: float = 1e-6,
@@ -830,6 +308,7 @@ class MSAT(JointBase):
         self.attention_head_dim = attention_head_dim
         self.temb_type = temb_type if temb_type is not None else "layerwise_mod"
         self.num_temb_tokens = 1  # Single time token when temb_type="input_token"
+        self.attn_dropout = attn_dropout
 
         # Set default attention_bias if not provided (MSAT default: True)
         if attention_bias is None:
@@ -925,135 +404,59 @@ class MSAT(JointBase):
         else:
             self.vl_proj_to_sa = nn.Identity()
 
-        if self.use_physics and physics_dim > 0:
-            # ── Physics-enabled architecture ──────────────────────────────────────
-            # Lower: ExpandedDoubleStreamBlocks [VL | SA | P] — extends DoubleStreamBlock with P stream
-            # Upper: ExpandedSingleStreamBlocks [VL+SA | P]  — extends SingleStreamBlock with P stream
-            # Pretrained weights load directly (same attribute names as base blocks).
+        if self.use_physics and physics_dim <= 0:
+            raise ValueError(f"use_physics needs a positive physics_dim, got {physics_dim}")
+        block = dict(
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+            attn_dropout=attn_dropout,
+            activation_fn=activation_fn,
+            attention_bias=attention_bias,
+            norm_eps=norm_eps,
+            qk_norm=qk_norm,
+            use_swiglu=use_swiglu,
+            positional_embeddings=positional_embeddings,
+            max_seq_length=action_model_max_seq_len,
+            temb_type=self.temb_type,
+            remove_bias=remove_bias,
+            pre_norm=pre_norm,
+            post_norm=post_norm,
+        )
+        if self.use_physics:
+            # Lower: ExpandedDoubleStreamBlocks [VL | SA | P], upper: ExpandedSingleStreamBlocks
+            # [VL+SA | P]. Physics tokens are projected to sa_dim by the physics head.
             _print(f"\n[MSAT] Physics mode: use_physics=True, physics_dim={physics_dim}")
-            _print(f"[MSAT] Lower: {depth_multi_stream} ExpandedDoubleStreamBlocks [VL | SA | P]")
-            _print(f"[MSAT] Upper: {depth_single_stream} ExpandedSingleStreamBlocks [VL+SA | P]")
-
-            self.double_blocks = self._build_expanded_double_blocks(
-                depth=depth_multi_stream,
-                sa_dim=sa_dim,
-                vl_dim=vl_dim,
-                p_dim=sa_dim,  # Physics tokens projected to sa_dim by PhysicalSignalEncoder
-                num_heads=num_attention_heads,
-                head_dim=attention_head_dim,
-                dropout=dropout,
-                activation_fn=activation_fn,
-                attention_bias=attention_bias,
-                norm_eps=norm_eps,
-                qk_norm=qk_norm,
-                use_swiglu=use_swiglu,
-                mlp_ratio=mlp_ratio,
-                vl_mlp_ratio=vl_mlp_ratio,
-                positional_embeddings=positional_embeddings,
-                max_seq_length=action_model_max_seq_len,
-                temb_type=self.temb_type,
-                remove_bias=remove_bias,
-                pre_norm=pre_norm,
-                post_norm=post_norm,
+            self.double_blocks = nn.ModuleList(
+                ExpandedDoubleStreamBlock(
+                    sa_dim=sa_dim, vl_dim=vl_dim, p_dim=sa_dim, vl_mlp_ratio=vl_mlp_ratio, **block
+                )
+                for _ in range(depth_multi_stream)
             )
-
-            single_stream_hidden_size = sa_dim
-            self.single_blocks = self._build_expanded_single_blocks(
-                depth=depth_single_stream,
-                hidden_size=single_stream_hidden_size,
-                p_dim=sa_dim,
-                num_heads=num_attention_heads,
-                head_dim=attention_head_dim,
-                dropout=dropout,
-                activation_fn=activation_fn,
-                attention_bias=attention_bias,
-                norm_eps=norm_eps,
-                qk_norm=qk_norm,
-                use_swiglu=use_swiglu,
-                mlp_ratio=mlp_ratio,
-                positional_embeddings=positional_embeddings,
-                max_seq_length=action_model_max_seq_len,
-                temb_type=self.temb_type,
-                remove_bias=remove_bias,
-                pre_norm=pre_norm,
-                post_norm=post_norm,
+            self.single_blocks = nn.ModuleList(
+                ExpandedSingleStreamBlock(hidden_size=sa_dim, p_dim=sa_dim, **block)
+                for _ in range(depth_single_stream)
             )
-
-            has_single_blocks = depth_single_stream > 0
-            sa_hidden_dim = single_stream_hidden_size if has_single_blocks else sa_dim
-            self._sa_hidden_dim = sa_hidden_dim
-
-            # Physics output projection (AdaLN-zero style)
             self.norm_out_physics = nn.LayerNorm(sa_dim, elementwise_affine=False, eps=1e-6)
             self.proj_out_physics_1 = nn.Linear(self.inner_dim, 2 * sa_dim, bias=not remove_bias)
             self.proj_out_physics_2 = nn.Linear(sa_dim, output_dim, bias=not remove_bias)
-
         else:
-            # ── Standard architecture (no physics) ────────────────────────────────
-            # Lower: DoubleStreamBlocks [VL | SA]
-            # Upper: SingleStreamBlocks [VL_proj | time_token | SA]
-
-            self.double_blocks = self._build_double_blocks(
-                depth=depth_multi_stream,
-                sa_dim=sa_dim,
-                vl_dim=vl_dim,
-                num_heads=num_attention_heads,
-                head_dim=attention_head_dim,
-                dropout=dropout,
-                activation_fn=activation_fn,
-                attention_bias=attention_bias,
-                norm_eps=norm_eps,
-                qk_norm=qk_norm,
-                use_swiglu=use_swiglu,
-                mlp_ratio=mlp_ratio,
-                vl_mlp_ratio=vl_mlp_ratio,
-                positional_embeddings=positional_embeddings,
-                max_seq_length=action_model_max_seq_len,
-                temb_type=self.temb_type,
-                remove_bias=remove_bias,
-                pre_norm=pre_norm,
-                post_norm=post_norm,
+            # Lower: DoubleStreamBlocks [VL | SA], upper: SingleStreamBlocks [VL_proj | time_token | SA]
+            self.double_blocks = nn.ModuleList(
+                DoubleStreamBlock(sa_dim=sa_dim, vl_dim=vl_dim, vl_mlp_ratio=vl_mlp_ratio, **block)
+                for _ in range(depth_multi_stream)
             )
-
-            single_stream_hidden_size = sa_dim
-            self.single_blocks = self._build_single_blocks(
-                depth=depth_single_stream,
-                hidden_size=single_stream_hidden_size,
-                num_heads=num_attention_heads,
-                head_dim=attention_head_dim,
-                dropout=dropout,
-                activation_fn=activation_fn,
-                attention_bias=attention_bias,
-                norm_eps=norm_eps,
-                qk_norm=qk_norm,
-                use_swiglu=use_swiglu,
-                mlp_ratio=mlp_ratio,
-                positional_embeddings=positional_embeddings,
-                max_seq_length=action_model_max_seq_len,
-                temb_type=self.temb_type,
-                remove_bias=remove_bias,
-                pre_norm=pre_norm,
-                post_norm=post_norm,
+            self.single_blocks = nn.ModuleList(
+                SingleStreamBlock(hidden_size=sa_dim, **block) for _ in range(depth_single_stream)
             )
-
-            has_single_blocks = depth_single_stream > 0
-            sa_hidden_dim = single_stream_hidden_size if has_single_blocks else sa_dim
-            self._sa_hidden_dim = sa_hidden_dim
 
         # Output projection (AdaLN-zero style) - for action prediction
-        self.norm_out = nn.LayerNorm(sa_hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out_1 = nn.Linear(self.inner_dim, 2 * sa_hidden_dim, bias=not remove_bias)
-        self.proj_out_2 = nn.Linear(sa_hidden_dim, output_dim, bias=not remove_bias)
-        _print(
-            f"[MSAT] Output projection: sa_hidden_dim={sa_hidden_dim} -> output_dim={output_dim}"
-        )
+        self.norm_out = nn.LayerNorm(sa_dim, elementwise_affine=False, eps=1e-6)
+        self.proj_out_1 = nn.Linear(self.inner_dim, 2 * sa_dim, bias=not remove_bias)
+        self.proj_out_2 = nn.Linear(sa_dim, output_dim, bias=not remove_bias)
 
         self._remove_bias = remove_bias
-
-        _print(
-            "[MSAT] Total number of MSAT parameters: ",
-            sum(p.numel() for p in self.parameters() if p.requires_grad),
-        )
 
     def forward(
         self,

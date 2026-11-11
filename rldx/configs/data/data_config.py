@@ -16,10 +16,11 @@
 # This file has been modified from the original NVIDIA Isaac GR00T N1.7.
 # Original source: https://github.com/NVIDIA/Isaac-GR00T
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-from rldx.data.types import ModalityConfig
+from rldx.data.types import EpisodeBoundaryPolicy, ModalityConfig
 
 from .embodiment_configs import MODALITY_CONFIGS
 
@@ -45,13 +46,48 @@ class SingleDatasetConfig:
 
     dataset_type: str = "physical_embodiment"
 
-    # Optional validation dataset path for open-loop evaluation
-    # If not provided, falls back to dataset_paths for evaluation
-    val_dataset_path: Optional[str] = None
+
+@dataclass
+class DataArgs:
+    """Data settings the command line sets."""
+
+    dataset_weight_by_steps: bool = False
+    """
+    If True, multiply each dataset's mix_ratio by ``len(dataset)`` (total
+    step count) before normalisation, so that batches sample each dataset
+    proportionally to its total steps. With this flag, mix_ratios act as
+    *boost / suppress multipliers* on top of length-proportional sampling
+    (e.g. ``--data.mix-ratios 1 1 0.2`` keeps the third dataset's
+    natural step share but multiplies it by 0.2). When False (default),
+    mix_ratios are used as raw weights regardless of dataset length —
+    short datasets are sampled at the same rate as long ones.
+    """
+
+    projector_grouping: str | None = None
+    """Optional projector-sharing policy. ``None`` preserves the tag mapping."""
+
+    shard_size: int = 2**10
+    """Size of the shard to use for dataset preloading."""
+
+    episode_sampling_rate: float = 0.1
+    """Sampling rate for episode steps."""
+
+    num_shards_per_epoch: int = int(1e5)
+    """Number of shards to use for the dataset. reduce this number if vram is limited (sharded mode only)."""
+
+    episode_boundary_policy: EpisodeBoundaryPolicy = EpisodeBoundaryPolicy.MASK
+    """How action-chunk positions past the end of an episode are treated.
+
+    ``MASK`` is the default and keeps the shipped behaviour. See
+    ``EpisodeBoundaryPolicy`` for what each option does.
+    """
+
+    override_pretraining_statistics: bool = False
+    """Use this run's dataset statistics even for tags the base checkpoint already has statistics for."""
 
 
 @dataclass
-class DataConfig:
+class DataConfig(DataArgs):
     """Dataset configuration (supports single or multiple datasets)."""
 
     # Leave empty by default for backwards-compatibility with the original
@@ -66,33 +102,15 @@ class DataConfig:
     # 1 and 2 are unified through `config.data.modality_configs`.
     # 3. modality configs saved in the pretrained checkpoint.
     modality_configs: dict[str, dict[str, ModalityConfig]] = field(
-        default_factory=lambda: MODALITY_CONFIGS
+        default_factory=lambda: copy.deepcopy(MODALITY_CONFIGS)
     )
 
-    # Dataset mode: "sharded" (default) or "standard" (simple random-access map-style)
-    dataset_mode: str = "sharded"
-
-    # Sharded dataset configuration (only used when dataset_mode == "sharded")
     download_cache: bool = False
-    shard_size: int = 2**10
-    episode_sampling_rate: float = 0.1
-    num_shards_per_epoch: int = int(1e5)
-
-    # Override statistics from the pretrained checkpoint
-    override_pretraining_statistics: bool = False
 
     # General task / mode config (shared across datasets)
     mode: str = "single_turn"
-    random_chop: float = 0.0
-    mock_dataset_mode: bool = False  # if True, cache the first datapoint of each dataset and always return one of them to simulate best-case dataloading
 
     # Data loading
     shuffle: bool = True
     seed: int = 42
     multiprocessing_context: str = "fork"  # Options: "fork", "spawn", and "forkserver"
-    allow_padding: bool = False
-
-    # Subsample ratio for the dataset
-    subsample_ratio: float = 1.0
-
-    video_backend: str = "torchcodec"

@@ -25,81 +25,69 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Callable, Optional
+from typing import NamedTuple, Optional
 
 import torch
 
+from rldx.configs.model.inference import GuidedRtcConfig, InferenceRtc, TrainedRtcConfig
 
-_EPS_TAU = 1e-2  # τ clip range for 1/(τ(1-τ)) guidance scale stability
+
+_EPS_TAU = 1e-2  # Keep the guidance scale finite at the τ endpoints.
 _EPS_DENOM = 1e-8
 
 
-@dataclass
-class RTCConfig:
-    """Parameters controlling RTC behaviour.
+@dataclass(frozen=True)
+class RtcTiming:
+    rtc: InferenceRtc
+    exec_horizon: int
+    horizon: int
 
-    Defaults disable RTC entirely (training_max_delay=0, inference_mode="none").
-    """
+    def __post_init__(self) -> None:
+        d, s, h = self.delay, self.exec_horizon, self.horizon
+        if not 1 <= d <= s <= h - d:
+            raise ValueError(f"must satisfy 1 <= d ({d}) <= s ({s}) <= H - d ({h - d}); H={h}")
 
-    # Training-time RTC. Per-sample prefix length d ~ U[0, max_delay].
-    # ``max_delay = 0`` disables training RTC (no extra prob knob — d=0 is a
-    # valid sample that reduces to standard flow-matching training).
-    training_max_delay: int = 0
+    @property
+    def delay(self) -> int:
+        return self.rtc.delay
 
-    # Inference-time RTC
-    inference_mode: str = "none"  # "none" | "trained" | "guided"
-    inference_delay: int = 0  # d (frozen prefix length)
-    inference_exec_horizon: int = 0  # s (execution horizon). 0 => H - d
+    @property
+    def guided(self) -> bool:
+        return isinstance(self.rtc, GuidedRtcConfig)
 
-    # Jacobian-specific.
-    #
-    # ``jacobian_beta`` clips the guidance scale ``min(β, 1/(τ(1-τ)))``. Note
-    # that ``1/(τ(1-τ)) ≥ 4`` for τ ∈ (0,1), so β ≤ 4 disables the paper's
-    # adaptive τ schedule entirely (scale collapses to β everywhere).
-    # Default β=5 lets the schedule activate near the τ→0 and τ→1 boundaries
-    # while keeping guidance stable mid-range.
-    jacobian_beta: float = 5.0
-    # Apply guidance only on the first ``N`` inference steps. Jacobian
-    # autograd through the full DiT multiplies inference memory several-fold
-    # and can OOM on full-size VLAs. ``None`` = guide every step.
-    jacobian_steps_only: Optional[int] = None
+    @property
+    def ramp(self) -> int:
+        return self.horizon - self.exec_horizon - self.delay
 
-    def enabled_training(self) -> bool:
-        return self.training_max_delay > 0
+    def soft_mask(self, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return compute_soft_mask_weights(
+            self.horizon, self.delay, self.exec_horizon, device=device, dtype=dtype
+        )
 
-    def enabled_inference(self) -> bool:
-        return self.inference_mode != "none" and self.inference_delay > 0
 
-    def validate(self, horizon: int) -> None:
-        if self.inference_mode not in ("none", "trained", "guided"):
-            raise ValueError(f"invalid inference_mode: {self.inference_mode}")
-        # Reject max_delay == horizon: it lets a sample have every position in
-        # the frozen prefix, producing an empty postfix and a zero-gradient
-        # loss contribution. Keep one position of postfix guaranteed.
-        if self.training_max_delay < 0 or self.training_max_delay >= horizon:
-            raise ValueError(
-                f"training_max_delay={self.training_max_delay} must be in [0, {horizon - 1}]"
-            )
-        # inference_mode='trained' requires the checkpoint to have been
-        # trained with rtc_training_max_delay > 0 (paper 2512.05964 Alg. 1).
-        # Otherwise the model has never seen clean-prefix / t=1 conditioning
-        # and will produce degenerate postfixes. The explicit check fails
-        # fast at init instead of silently-wrong inference.
-        if self.inference_mode == "trained" and self.training_max_delay == 0:
-            raise ValueError(
-                "inference_mode='trained' requires a checkpoint trained with "
-                "rtc_training_max_delay > 0. This config has training_max_delay=0 "
-                "(no RTC training signal). For RTC on an untrained checkpoint, "
-                "use inference_mode='guided' (Jacobian universal guidance; "
-                "arXiv 2506.07339, no retraining needed)."
-            )
-        d = self.inference_delay
-        s = self.inference_exec_horizon or (horizon - d)
-        if self.inference_mode != "none":
-            if not (0 <= d <= s <= horizon - d):
-                raise ValueError(
-                    f"must satisfy 0 <= d ({d}) <= s ({s}) <= H - d ({horizon - d}); H={horizon}"
-                )
+def rtc_timing(rtc: InferenceRtc | None, training_max_delay: int, horizon: int) -> RtcTiming | None:
+    """Resolve the serving RTC against what the checkpoint was trained with."""
+    if rtc is None:
+        return None
+    # A prefix longer than any delay sampled in training asks the checkpoint to
+    # honor a conditioning it has never seen (2512.05964 Alg. 1).
+    if isinstance(rtc, TrainedRtcConfig) and not 0 < rtc.delay <= training_max_delay:
+        raise ValueError(
+            f"trained RTC with delay={rtc.delay} needs a checkpoint trained with "
+            f"rtc_training_max_delay >= {rtc.delay}, this one has {training_max_delay}. "
+            "Guided RTC needs no RTC training."
+        )
+    return RtcTiming(rtc, rtc.exec_horizon, horizon)
+
+
+class RtcActions(NamedTuple):
+    actions: torch.Tensor
+    present: torch.Tensor
+
+
+class RtcInput(NamedTuple):
+    prefix: RtcActions
+    postfix: RtcActions | None
 
 
 def sample_training_prefix(
@@ -179,9 +167,9 @@ def compute_soft_mask_weights(
     per-sample ``d`` and ``s`` are supported. Returns ``(B, H)``.
     """
     if isinstance(d, int):
-        d = torch.tensor([d], device=device)
+        d = torch.full((1,), d, device=device)
     if isinstance(s, int):
-        s = torch.tensor([s], device=device)
+        s = torch.full((1,), s, device=device)
     if d.dim() == 0:
         d = d.unsqueeze(0)
     if s.dim() == 0:
@@ -227,76 +215,17 @@ def guidance_scale(tau: float, beta: float) -> float:
     return float(min(c * inv_r2, beta))
 
 
-def guided_velocity(
-    velocity_fn: Callable[[torch.Tensor], torch.Tensor],
-    x_tau: torch.Tensor,
-    tau: float,
-    Y: torch.Tensor,
-    W: torch.Tensor,
-    beta: float,
-) -> torch.Tensor:
-    """Jacobian-guided velocity update (Eq. 2 of arXiv 2506.07339).
-
-    ``v_guided = v + c · VJP[(Y − Â¹_t)ᵀ diag(W), ∂Â¹_t/∂x_τ]``
-
-    where ``Â¹_t = x_τ + (1−τ) v`` and
-    ``c = min(β, 1 / (τ(1−τ)))``.
-
-    Args:
-        velocity_fn: maps ``x_τ → v`` (must be differentiable wrt the input).
-        x_tau: ``(B, H, D)`` current noisy trajectory.
-        tau: scalar flow-matching time in (0, 1).
-        Y: ``(B, H, D)`` inpainting target (frozen prefix for the prefix
-            region; value in the ramp/free region is irrelevant because W=0).
-        W: ``(B, H)`` or ``(H,)`` soft mask weights (Eq. 5).
-        beta: guidance scale clip constant.
-    Returns:
-        ``(B, H, D)`` guided velocity, detached from the autograd graph.
-    """
-    if W.dim() == 1:
-        W = W.unsqueeze(0).expand(x_tau.shape[0], -1)
-
-    x_in = x_tau.detach().requires_grad_(True)
-    with torch.enable_grad():
-        v = velocity_fn(x_in)
-        a_hat = x_in + (1.0 - tau) * v
-        diff = Y.detach() - a_hat.detach()  # (B, H, D), no grad through diff
-        grad_outputs = W.unsqueeze(-1).to(dtype=a_hat.dtype) * diff  # (B, H, D)
-        vjp = torch.autograd.grad(
-            outputs=a_hat,
-            inputs=x_in,
-            grad_outputs=grad_outputs,
-            retain_graph=False,
-            create_graph=False,
-        )[0]
-
-    c = guidance_scale(float(tau), beta)
-    return (v.detach() + c * vjp.detach()).to(dtype=x_tau.dtype)
-
-
-def rtc_config_from_rldx(cfg) -> RTCConfig:
-    """Build an RTCConfig from the flat fields on an RLDXConfig instance."""
-    return RTCConfig(
-        training_max_delay=int(getattr(cfg, "rtc_training_max_delay", 0) or 0),
-        inference_mode=str(getattr(cfg, "rtc_inference_mode", "none")),
-        inference_delay=int(getattr(cfg, "rtc_inference_delay", 0) or 0),
-        inference_exec_horizon=int(getattr(cfg, "rtc_inference_exec_horizon", 0) or 0),
-        jacobian_beta=float(getattr(cfg, "rtc_jacobian_beta", 5.0)),
-        jacobian_steps_only=(
-            None
-            if getattr(cfg, "rtc_jacobian_steps_only", None) is None
-            else int(cfg.rtc_jacobian_steps_only)
-        ),
-    )
-
-
 __all__ = [
-    "RTCConfig",
-    "rtc_config_from_rldx",
+    "GuidedRtcConfig",
+    "InferenceRtc",
+    "RtcActions",
+    "RtcInput",
+    "RtcTiming",
+    "TrainedRtcConfig",
+    "rtc_timing",
     "sample_training_prefix",
     "build_per_token_time",
     "build_noisy_trajectory_rtc",
     "compute_soft_mask_weights",
-    "guided_velocity",
     "guidance_scale",
 ]

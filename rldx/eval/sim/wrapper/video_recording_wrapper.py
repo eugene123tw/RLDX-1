@@ -24,10 +24,19 @@ import av
 import cv2
 import gymnasium as gym
 import numpy as np
-from rldx.utils.video_utils import get_accumulate_timestamp_idxs
+from rldx.data.video import get_accumulate_timestamp_idxs
 
 
 class VideoRecorder:
+    """
+    From Diffusion Policy, received via Isaac GR00T:
+    https://github.com/real-stanford/diffusion_policy, diffusion_policy/real_world/video_recorder.py
+
+    Copyright (c) 2023 Columbia Artificial Intelligence and Robotics Lab
+
+    Diffusion Policy is licensed under the MIT License; the full text is in NOTICE.
+    """
+
     def __init__(
         self,
         fps,
@@ -174,10 +183,16 @@ class VideoRecordingWrapper(gym.Wrapper):
 
         self.episode_id = kwargs.get("start_episode_id", -1)
         self.name_prefix = kwargs.get("name_prefix", "episode")
+        # Per-env recording cap; the rollout loop's target_per_env matches it.
+        self.max_episodes_per_env = kwargs.get("max_episodes_per_env", None)
         # Optional: deterministic seeding per episode (useful when resuming / skipping episodes)
         # If set, reset() will set seed = base_seed * seed_stride + episode_id unless caller provides seed explicitly.
         self.base_seed = kwargs.get("base_seed", None)
         self.seed_stride = int(kwargs.get("seed_stride", 100000))
+        # Episode ids this env still owes, in run order. None = count up.
+        _queue = kwargs.get("episode_id_queue", None)
+        self._episode_id_queue = list(_queue) if _queue is not None else None
+        self._queue_exhausted = False
 
     def _resize_frames_to_common_height(self, frames):
         """
@@ -211,6 +226,15 @@ class VideoRecordingWrapper(gym.Wrapper):
         return resized_frames
 
     def reset(self, **kwargs):
+        # Staged as id - 1: the increment below names the file and the
+        # seeding block reads episode_id before it.
+        if self._episode_id_queue is not None:
+            if self._episode_id_queue:
+                self.episode_id = self._episode_id_queue.pop(0) - 1
+            else:
+                # Past the last owed episode: recording would overwrite an id.
+                self._queue_exhausted = True
+
         # Deterministic reset seeding (only if caller didn't specify a seed)
         if kwargs.get("seed", None) is None and self.base_seed is not None:
             try:
@@ -395,8 +419,16 @@ class VideoRecordingWrapper(gym.Wrapper):
 
         if self.video_dir is not None:
             self.episode_id += 1
-            filename = f"{self.name_prefix}-episode_{self.episode_id}.mp4"
-            self.file_path = self.video_dir / filename
+            # This env has its share; the rollout loop drains the others.
+            if self._queue_exhausted:
+                self.file_path = None
+            elif self.max_episodes_per_env is None or self.episode_id < int(
+                self.max_episodes_per_env
+            ):
+                filename = f"{self.name_prefix}-episode_{self.episode_id}.mp4"
+                self.file_path = self.video_dir / filename
+            else:
+                self.file_path = None
         return result
 
     def step(self, action):

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Local (non-slurm) LIBERO evaluation runner.
+# LIBERO evaluation runner.
 # Usage: eval_libero.sh <CKPT_NAME> <MODEL_PATH> [GPU_ID] [MAX_PARALLEL]
 set -u
 
@@ -10,12 +10,36 @@ MODEL_PATH="${2:?MODEL_PATH required}"
 GPU_ID="${3:-0}"
 MAX_PARALLEL="${4:-4}"
 
+# Apply the same trial count to all four suites.
+N_EPISODES="${N_EPISODES:-50}"
+N_ACTION_STEPS="${N_ACTION_STEPS:-5}"
+
 BASE_DIR="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
-LIBERO_PY="$BASE_DIR/rldx/eval/sim/LIBERO/libero_uv/.venv/bin/python"
+LIBERO_PY="$BASE_DIR/run_scripts/eval/libero/libero_uv/.venv/bin/python"
+OUT_BASE="${MODEL_OUTPUT_DIR:-$BASE_DIR/output_final}"
+
+if [ ! -f "$LIBERO_PY" ]; then
+  echo "[ERROR] LIBERO venv not found. Run: bash run_scripts/eval/libero/setup_libero.sh" >&2
+  exit 1
+fi
+export LIBERO_CONFIG_PATH="$BASE_DIR/run_scripts/eval/libero/libero_uv/.venv/libero_config"
+if [ ! -f "$LIBERO_CONFIG_PATH/config.yaml" ]; then
+  echo "[ERROR] No LIBERO config at $LIBERO_CONFIG_PATH. Re-run: bash run_scripts/eval/libero/setup_libero.sh" >&2
+  exit 1
+fi
+
+port_is_free() {
+  "$LIBERO_PY" -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+sys.exit(1 if s.connect_ex(('127.0.0.1', $1)) == 0 else 0)
+" 2>/dev/null
+}
 
 find_free_port() {
   local port=$1
-  while ss -lnt | awk '{print $4}' | grep -q ":$port$"; do
+  while ! port_is_free "$port"; do
     port=$((port + 1))
     [ "$port" -gt 65000 ] && port=20000
   done
@@ -26,22 +50,23 @@ PORT=$(find_free_port $((20000 + RANDOM % 40000)))
 echo "[i] CKPT_NAME=$CKPT_NAME"
 echo "[i] MODEL_PATH=$MODEL_PATH"
 echo "[i] GPU_ID=$GPU_ID  MAX_PARALLEL=$MAX_PARALLEL  PORT=$PORT"
+echo "[i] n_episodes=$N_EPISODES  n_action_steps=$N_ACTION_STEPS"
 
 cd "$BASE_DIR"
 CUDA_VISIBLE_DEVICES=$GPU_ID uv run python rldx/eval/run_rldx_server.py \
     --model-path "$MODEL_PATH" \
     --embodiment-tag GENERAL_EMBODIMENT \
-    --use-sim-policy-wrapper \
-    --no-strict \
     --host 127.0.0.1 \
     --port "$PORT" &
 SERVE_PID=$!
 trap 'echo "[i] killing server PID=$SERVE_PID"; kill $SERVE_PID 2>/dev/null' EXIT
 
 echo "[i] Waiting for server (PID=$SERVE_PID) readiness..."
-for i in $(seq 1 120); do
-  if ss -lnt | awk '{print $4}' | grep -q ":$PORT$"; then
+READY=0
+for i in $(seq 1 600); do
+  if ! port_is_free "$PORT"; then
     echo "[i] Server listening on :$PORT after ${i}s"
+    READY=1
     break
   fi
   if ! kill -0 $SERVE_PID 2>/dev/null; then
@@ -49,6 +74,9 @@ for i in $(seq 1 120); do
   fi
   sleep 1
 done
+if [ "$READY" != 1 ]; then
+  echo "[!] Server never bound to :$PORT within 600s"; exit 1
+fi
 sleep 5  # give server a moment past port-open
 
 LIBERO_10_TASKS=(
@@ -123,36 +151,51 @@ for idx in "${!ALL_TASKS[@]}"; do
     SUITE="${ALL_SUITES[$idx]}"
     TIDX="${ALL_TASK_INDICES[$idx]}"
     CLEAN="${TASK#libero_sim/}"
-    OUT="$BASE_DIR/output_final/libero/$CKPT_NAME/$SUITE/$CLEAN"
+    OUT="$OUT_BASE/libero/$CKPT_NAME/$SUITE/$CLEAN"
     mkdir -p "$OUT"
-    if [ "$SUITE" == "libero_10" ]; then N_EP=50; else N_EP=20; fi
-    echo "[i] [$((idx+1))/$TOTAL] $SUITE :: $CLEAN (n_ep=$N_EP)"
+    echo "[i] [$((idx+1))/$TOTAL] $SUITE :: $CLEAN (n_ep=$N_EPISODES)"
     "$LIBERO_PY" "$BASE_DIR/rldx/eval/rollout_policy.py" \
-        --n_episodes $N_EP \
+        --n_episodes "$N_EPISODES" \
         --policy_client_host 127.0.0.1 \
         --policy_client_port "$PORT" \
         --max_episode_steps 720 \
         --env_name "$TASK" \
-        --n_action_steps 8 \
+        --n_action_steps "$N_ACTION_STEPS" \
         --n_envs 5 \
         --video_dir "$OUT" \
         >& "$OUT/eval-local-$TIDX.log" &
     RUN_PIDS+=($!)
-    # throttle to MAX_PARALLEL in flight
-    while [ "$(jobs -rp | wc -l)" -ge "$MAX_PARALLEL" ]; do
+    # throttle to MAX_PARALLEL rollouts in flight; the background server is a job too
+    while :; do
+        running=0
+        for pid in "${RUN_PIDS[@]}"; do
+            kill -0 "$pid" 2>/dev/null && running=$((running + 1))
+        done
+        [ "$running" -lt "$MAX_PARALLEL" ] && break
         sleep 5
     done
 done
 
 echo "[i] All tasks launched, waiting for completion..."
-for pid in "${RUN_PIDS[@]}"; do wait "$pid"; done
+FAILED=()
+for idx in "${!RUN_PIDS[@]}"; do
+    if ! wait "${RUN_PIDS[$idx]}"; then
+        FAILED+=("${ALL_SUITES[$idx]} :: ${ALL_TASKS[$idx]#libero_sim/}")
+    fi
+done
 
 echo "[i] ===== Summary ====="
 for idx in "${!ALL_TASKS[@]}"; do
     SUITE="${ALL_SUITES[$idx]}"
     CLEAN="${ALL_TASKS[$idx]#libero_sim/}"
     TIDX="${ALL_TASK_INDICES[$idx]}"
-    LOG="$BASE_DIR/output_final/libero/$CKPT_NAME/$SUITE/$CLEAN/eval-local-$TIDX.log"
-    SR=$(grep -oE "success_rate[^0-9]*[0-9.]+" "$LOG" 2>/dev/null | tail -1 || echo "N/A")
-    echo "[i] $SUITE :: $CLEAN -> $SR"
+    LOG="$OUT_BASE/libero/$CKPT_NAME/$SUITE/$CLEAN/eval-local-$TIDX.log"
+    SR=$(grep -oE "success rate[^0-9]*[0-9.]+" "$LOG" 2>/dev/null | tail -1)
+    echo "[i] $SUITE :: $CLEAN -> ${SR:-N/A}"
 done
+
+if [ ${#FAILED[@]} -gt 0 ]; then
+    echo "[!] ${#FAILED[@]} task(s) failed:"
+    printf '[!]   %s\n' "${FAILED[@]}"
+    exit 1
+fi

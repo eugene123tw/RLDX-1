@@ -77,11 +77,6 @@ class ActionChunk(Generic[PoseType]):
         """Get the timestamps"""
         return self._times.copy()
 
-    @property
-    def num_poses(self) -> int:
-        """Get the number of poses in the action chunking"""
-        return len(self._poses)
-
     def relative_chunking(
         self, reference_frame: Optional[PoseType] = None
     ) -> "ActionChunk[PoseType]":
@@ -110,38 +105,6 @@ class ActionChunk(Generic[PoseType]):
         # Return a new instance of the same action chunking class
         # (e.g., JointActionChunk or EndEffectorActionChunk)
         return self.__class__(relative_poses, times=self.times)
-
-    def delta_chunking(self, reference_frame: Optional[PoseType] = None) -> "ActionChunk[PoseType]":
-        """
-        Compute the delta action chunking where each pose represents the relative
-        transformation from the previous frame.
-
-        If reference_frame is provided, it is treated as the first frame, and the
-        first delta will be from reference_frame to the first pose in the action chunking.
-        Otherwise, the first pose in the delta action chunking will be the identity/zero transformation.
-
-        Args:
-            reference_frame: Optional reference pose to use as the first frame.
-
-        Returns:
-            A new ActionChunk of the same type where each pose is relative to the previous pose.
-        """
-        if not self._poses:
-            return self.__class__([], times=[])
-
-        delta_poses: List[PoseType] = []
-
-        # Determine the initial reference for the very first pose.
-        # If a reference_frame is given, the first delta is pose[0] - reference_frame.
-        # If not, the first delta is pose[0] - pose[0], resulting in an identity/zero pose.
-        prev_pose = reference_frame if reference_frame is not None else self._poses[0]
-
-        for current_pose in self._poses:
-            delta: PoseType = current_pose - prev_pose  # type: ignore[assignment]
-            delta_poses.append(delta)
-            prev_pose = current_pose  # Update the reference for the next step
-
-        return self.__class__(delta_poses, times=self.times.tolist())
 
     def to_absolute_chunking(self, reference_frame: PoseType) -> "ActionChunk[PoseType]":
         """
@@ -228,9 +191,6 @@ class JointActionChunk(ActionChunk[JointPose]):
         # Get relative trajectory with custom reference
         reference = JointPose([0.1, 0.1, 0.1])
         relative_traj = action_chunking.relative_chunking(reference_frame=reference)
-
-        # Get delta trajectory (incremental changes)
-        delta_traj = action_chunking.delta_chunking()
 
         # Convert relative trajectory back to absolute
         reference = JointPose([0.1, 0.1, 0.1])
@@ -434,9 +394,6 @@ class EndEffectorActionChunk(ActionChunk[EndEffectorPose]):
                                    rotation_type="quat", rotation_order="wxyz")
         relative_traj = action_chunking.relative_chunking(reference_frame=reference)
 
-        # Get delta trajectory
-        delta_traj = action_chunking.delta_chunking()
-
         # Convert relative trajectory back to absolute
         reference = EndEffectorPose(translation=[0.5, 0, 0], rotation=[1,0,0,0],
                                    rotation_type="quat", rotation_order="wxyz")
@@ -472,6 +429,23 @@ class EndEffectorActionChunk(ActionChunk[EndEffectorPose]):
             raise TypeError("All poses must be EndEffectorPose objects for EndEffectorActionChunk")
 
         super().__init__(poses, times)
+
+    @classmethod
+    def from_array(cls, data: np.ndarray, action_format: ActionFormat) -> "EndEffectorActionChunk":
+        """
+        Create an EndEffectorActionChunk from a 2-D array using the specified action format.
+
+        This is the inverse of ``.to(action_format)``.
+
+        Args:
+            data: Array of shape (N, D) where D depends on the action_format.
+            action_format: The format that describes the layout of each row.
+
+        Returns:
+            EndEffectorActionChunk with N poses.
+        """
+        poses = [EndEffectorPose.from_action_format(row, action_format) for row in data]
+        return cls(poses)
 
     def interpolate(
         self, num_points: Optional[int] = None, times: Optional[NDArray[np.float64]] = None

@@ -9,7 +9,7 @@
 #     pre-commit run --all-files
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.10
+    rev: v0.15.22
     hooks:
       - id: ruff
         name: ruff check (rldx/)
@@ -19,3 +19,11 @@ repos:
         name: ruff format --check (rldx/)
         args: [--check, rldx/]
         pass_filenames: false
+
+  # Earliest of the secret gates: this blocks the commit, CI blocks the merge,
+  # and push protection blocks the push to the public mirror. Reads the
+  # repo-root .gitleaks.toml, whose header explains the custom rules.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

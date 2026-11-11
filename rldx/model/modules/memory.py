@@ -3,6 +3,16 @@ Memory module for cognition tokens with temporal context aggregation.
 
 This module implements a Transformer-based memory that fuses cognition token embeddings
 from multiple timesteps to provide temporal context for action prediction.
+
+Its attention stack is built on the Llama implementation in HuggingFace transformers,
+which is Apache-2.0 like this repository. Four symbols are close enough to that source
+to carry an attribution notice in their own docstrings -- ``RotaryEmbedding``,
+``rotate_half``, ``apply_rotary_pos_emb`` and ``SwiGLUMLP``. ``MultiHeadAttention``
+follows the same architecture (the projection names come with the ``LlamaConfig`` it
+consumes) but its body is RLWRLD's: it calls scaled_dot_product_attention directly,
+expands KV heads with repeat_interleave, and keeps no cache. There is deliberately no
+file-level copyright header -- this module is not a copy of any upstream file, so each
+notice sits on the symbol it covers.
 """
 
 from typing import Optional
@@ -14,12 +24,26 @@ import torch.nn.functional as F
 from transformers import LlamaConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
+from rldx.dist import rank_zero_print as _print
 from rldx.model.modules.norms import RMSNorm
-from rldx.utils.dist import rank_zero_print as _print
 
 
 class RotaryEmbedding(nn.Module):
-    """Rotary Position Embedding (RoPE)."""
+    """Rotary Position Embedding (RoPE).
+
+    ``forward`` follows ``LlamaRotaryEmbedding`` in HuggingFace transformers:
+    https://github.com/huggingface/transformers/blob/8ac2b916b042b1f78b75c9eb941c0f5d2cdd8e10/src/transformers/models/llama/modeling_llama.py
+
+    transformers is licensed under the Apache License, Version 2.0, and the upstream file
+    carries a copyright line, so it is reproduced here as Section 4(c) requires:
+
+        Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+
+    Modified from the original, per Section 4(b): the autocast block and the
+    ``attention_scaling`` factor are dropped, and ``__init__`` takes an explicit ``dim``,
+    ``max_position_embeddings`` and ``base`` where the pinned revision derives all three
+    from a config object.
+    """
 
     def __init__(self, dim: int, max_position_embeddings: int = 2048, base: float = 10000.0):
         super().__init__()
@@ -43,14 +67,28 @@ class RotaryEmbedding(nn.Module):
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotates half the hidden dims of the input."""
+    """Rotates half the hidden dims of the input.
+
+    Copied from HuggingFace transformers, including this docstring line; only the type
+    annotations are added. See the notice on ``RotaryEmbedding`` above for the license
+    and copyright line.
+    https://github.com/huggingface/transformers/blob/8ac2b916b042b1f78b75c9eb941c0f5d2cdd8e10/src/transformers/models/llama/modeling_llama.py
+    """
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """Apply rotary position embedding to query and key tensors."""
+    """Apply rotary position embedding to query and key tensors.
+
+    The body is HuggingFace transformers': the two rotation lines and the return are
+    identical, and the two ``unsqueeze`` calls differ only in taking a fixed 1 where
+    upstream takes an ``unsqueeze_dim`` argument. The signature is narrowed to this
+    module's use, dropping the unused ``position_ids``. See the notice on
+    ``RotaryEmbedding`` above for the license and copyright line.
+    https://github.com/huggingface/transformers/blob/8ac2b916b042b1f78b75c9eb941c0f5d2cdd8e10/src/transformers/models/llama/modeling_llama.py
+    """
     cos = cos.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
     sin = sin.unsqueeze(1)  # [batch, 1, seq_len, head_dim]
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -132,7 +170,15 @@ class MultiHeadAttention(nn.Module):
 
 
 class SwiGLUMLP(nn.Module):
-    """MLP module with SwiGLU activation."""
+    """MLP module with SwiGLU activation.
+
+    The projection triple and the ``forward`` expression are ``LlamaMLP``'s from
+    HuggingFace transformers, with two settings fixed rather than read from the config:
+    ``nn.SiLU()`` in place of ``ACT2FN[config.hidden_act]``, and ``bias=False`` in place
+    of ``bias=config.mlp_bias``. See the notice on ``RotaryEmbedding`` above for the
+    license and copyright line.
+    https://github.com/huggingface/transformers/blob/8ac2b916b042b1f78b75c9eb941c0f5d2cdd8e10/src/transformers/models/llama/modeling_llama.py
+    """
 
     def __init__(self, config: LlamaConfig):
         super().__init__()
@@ -348,7 +394,7 @@ class TransformerMemory(nn.Module):
         hidden_states = inputs_embeds
 
         # Add sinusoidal positional embeddings if not using RoPE
-        if not self.use_rope and hasattr(self, "pos_emb"):
+        if not self.use_rope:
             hidden_states = self.pos_emb(hidden_states)
 
         # Process through transformer layers

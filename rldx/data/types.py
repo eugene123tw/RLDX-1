@@ -33,6 +33,17 @@ class MessageType(Enum):
     TEXT = "text"
 
 
+class EpisodeBoundaryPolicy(Enum):
+    """What to do with action-chunk positions that fall past the episode end.
+
+    ``MASK`` keeps them out of the loss via ``valid_action_horizon``; ``PAD``
+    trains on the padded targets, which mean "stay put". Neither touches the model.
+    """
+
+    MASK = "mask"
+    PAD = "pad"
+
+
 class ActionRepresentation(Enum):
     RELATIVE = "relative"
     DELTA = "delta"
@@ -60,7 +71,7 @@ class VLAStepData:
     """
 
     # Core data
-    images: dict[str, list[np.ndarray]]  # view_name -> list[np.ndarray] (for temporal stacking)
+    images: dict[str, np.ndarray | list[np.ndarray]]  # view_name -> (T,H,W,C) or frame list
     states: dict[
         str, np.ndarray
     ]  # state_name -> np.ndarray (dim,) for single step or (horizon, dim) for trajectory
@@ -105,7 +116,15 @@ class ModalityConfig:
     action_configs: list[ActionConfig] | None = None
 
     def __post_init__(self):
-        """Set default values for action-related fields if not specified."""
+        """Validate fields and set default values."""
+        if self.delta_indices is None or not isinstance(self.delta_indices, list):
+            raise ValueError(f"delta_indices must be a non-None list, got {self.delta_indices!r}")
+        if (
+            self.modality_keys is None
+            or not isinstance(self.modality_keys, list)
+            or len(self.modality_keys) == 0
+        ):
+            raise ValueError(f"modality_keys must be a non-empty list, got {self.modality_keys!r}")
         if self.action_configs is not None:
             assert len(self.action_configs) == len(self.modality_keys), (
                 f"Number of action configs ({len(self.action_configs)}) must match number of modality keys ({len(self.modality_keys)})"

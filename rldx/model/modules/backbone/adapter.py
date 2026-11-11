@@ -1,3 +1,4 @@
+from functools import partial
 import os
 from typing import Optional
 
@@ -7,8 +8,24 @@ import torch.nn.functional as F
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.utils import is_torchdynamo_compiling
 
-from rldx.model.modules.backbone.modeling_vtc import VTC_Qwen3VL
-from rldx.utils.dist import rank_zero_print as _print
+from rldx.configs.execution import InferenceRuntimeProfile, RuntimeProfile, TrainingRuntimeProfile
+from rldx.configs.model.rldx import BackboneLoraConfig
+from rldx.dist import rank_zero_print as _print
+from rldx.model.lora import inject_lora
+from rldx.model.modules.backbone.modeling_vtc import (
+    COMPRESSION_LAYER,
+    VTC_Qwen3VL,
+    configure_token_compression,
+)
+from rldx.model.modules.backbone.padded_vision_mlp import pad_vision_mlps
+from rldx.model.modules.backbone.qwen3vl_execution import (
+    build_qwen3vl_execution_kernels,
+    install_qwen3vl_execution_kernels,
+)
+from rldx.model.quantization.sites import LinearSite
+from rldx.planner.input.contracts import PreparedQwen3VLInputs, project_qwen3vl_inputs
+from rldx.planner.input.positioning import COG_PLACEHOLDER_TOKEN_ID, extend_for_cog_tokens
+from rldx.planner.input.spec import Qwen3VLInputSpec
 
 
 # Default attention implementation for the Qwen3-VL backbone load.
@@ -19,6 +36,57 @@ _DEFAULT_ATTN_IMPL = os.environ.get("RLDX_ATTN_IMPL", "flash_attention_2")
 
 
 class VTCQwen3VLBackbone(nn.Module):
+    def fuse_text_projections(self) -> None:
+        for wrapped in self.qwen_model.model.language_model.layers:
+            wrapped.layer.fuse_projections()
+
+    def quantization_sites(self):
+        for wrapped in self.qwen_model.model.language_model.layers:
+            layer = wrapped.layer
+            for name in ("qkv_proj", "o_proj"):
+                yield LinearSite(
+                    "text", layer.self_attn, name, input_bound=partial(layer.input_bound, name)
+                )
+            yield LinearSite(
+                "text",
+                layer.mlp,
+                "gate_up_proj",
+                input_bound=partial(layer.input_bound, "gate_up_proj"),
+            )
+            yield LinearSite("text", layer.mlp, "down_proj", elementwise_input=True)
+        for block in self.qwen_model.model.visual.blocks:
+            for name in ("qkv", "proj"):
+                yield LinearSite(
+                    "vision", block.attn, name, input_bound=partial(block.input_bound, name)
+                )
+            yield LinearSite(
+                "vision",
+                block.mlp,
+                "linear_fc1",
+                input_bound=partial(block.input_bound, "linear_fc1"),
+            )
+            yield LinearSite(
+                "vision",
+                block.mlp,
+                "linear_fc2",
+                elementwise_input=True,
+                input_bound=partial(block.input_bound, "linear_fc2"),
+            )
+
+    def prepare_for_execution(self, profile: RuntimeProfile) -> None:
+        """Install the selected execution backend for shared Qwen kernels."""
+        match profile:
+            case InferenceRuntimeProfile():
+                kernels = build_qwen3vl_execution_kernels(
+                    profile.backend,
+                    planned_text_layers=True,
+                    attention=self.qwen_model.config.text_config._attn_implementation,
+                )
+                self.qwen_model.model.visual.keep_layout_embeddings()
+            case TrainingRuntimeProfile():
+                kernels = build_qwen3vl_execution_kernels(profile.backend)
+        install_qwen3vl_execution_kernels(self.qwen_model, kernels)
+
     def __init__(
         self,
         model_name: str,
@@ -29,12 +97,12 @@ class VTCQwen3VLBackbone(nn.Module):
         use_flash_attention: bool = False,
         load_bf16: bool = False,
         tune_top_llm_layers: int = 0,
-        trainable_params_fp32: bool = False,
-        use_cog_tokens: bool = False,
+        freeze_cog_tokens: bool = False,
         cog_mode: str = "cog_only",
         n_cog_tokens: int = 8,
         motion_config: Optional[dict] = None,
         transformers_loading_kwargs: Optional[dict] = None,
+        image_max_area: int = 65536,
         **kwargs,
     ):
         """
@@ -71,41 +139,32 @@ class VTCQwen3VLBackbone(nn.Module):
             _print("[i] Creating VTC-Qwen3-VL architecture only (weights from checkpoint)")
             from transformers import AutoConfig
 
-            from rldx.model.modules.backbone.modeling_vtc import LayerWrapper
-
             backbone_config = AutoConfig.from_pretrained(model_name, **transformers_loading_kwargs)
             if motion_config is not None:
                 for k, v in motion_config.items():
                     setattr(backbone_config.vision_config, k, v)
             backbone_config._attn_implementation = _DEFAULT_ATTN_IMPL
-            self.qwen_model = VTC_Qwen3VL._from_config(backbone_config)
-            for layer_idx in range(len(self.qwen_model.model.language_model.layers)):
-                self.qwen_model.model.language_model.layers[layer_idx] = LayerWrapper(
-                    self.qwen_model.model.language_model.layers[layer_idx],
-                    layer_idx=layer_idx,
-                    internal_projection=4,
-                    img_pattern=[151652],
-                    motion_token=1,
-                )
             if load_bf16:
-                self.qwen_model = self.qwen_model.to(torch.bfloat16)
+                # Nested model configs determine parameter dtype; RoPE starts in FP32.
+                backbone_config.dtype = torch.bfloat16
+                backbone_config.text_config.dtype = torch.bfloat16
+                backbone_config.vision_config.dtype = torch.bfloat16
+            self.qwen_model = VTC_Qwen3VL._from_config(
+                backbone_config, image_max_area=image_max_area
+            )
+            configure_token_compression(self.qwen_model.model.language_model)
         else:
             _print(f"[i] Loading VTC-Qwen3-VL model from {model_name}")
             self.qwen_model = VTC_Qwen3VL.from_pretrained(
                 model_name,
                 motion_config=motion_config,
+                image_max_area=image_max_area,
                 attn_implementation=_DEFAULT_ATTN_IMPL,
                 torch_dtype=torch.bfloat16,
                 **transformers_loading_kwargs,
             )
-        # Keep BatchNorm running stats in float32 for bf16 compatibility
-        motion_block = getattr(self.qwen_model.model.visual, "motion_block", None)
-        if motion_block is not None:
-            for m in motion_block.modules():
-                if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)):
-                    m.float()
+        pad_vision_mlps(self.qwen_model.model.visual)
         self.qwen_linear = torch.nn.Identity()
-        self.use_cog_tokens = bool(use_cog_tokens)
         self.cog_mode = cog_mode
         self.n_cog_tokens = int(n_cog_tokens)
 
@@ -158,11 +217,9 @@ class VTCQwen3VLBackbone(nn.Module):
             _print(
                 f"[motion module vl_input] Created moss_proj: {vit_hidden_size} -> {llm_hidden_size}, pool_type={self.motion_pool_type}"
             )
-            assert use_cog_tokens, "motion module vl_input requires use_cog_tokens=True"
 
-        if self.use_cog_tokens:
-            feature_dim = self.qwen_model.model.language_model.config.hidden_size
-            self._init_cog_token_modules(feature_dim)
+        feature_dim = self.qwen_model.model.language_model.config.hidden_size
+        self._init_cog_token_modules(feature_dim)
 
         total_layers = len(self.qwen_model.model.language_model.layers)
 
@@ -178,28 +235,35 @@ class VTCQwen3VLBackbone(nn.Module):
         while len(self.qwen_model.model.language_model.layers) > max_k:
             self.qwen_model.model.language_model.layers.pop(-1)
 
-        self.select_layers = hs_indices
-        self._hs_idx = lambda k: k
-
         _print(
-            f"\n[i] Select layers (hs indices): {self.select_layers} "
+            f"\n[i] Select layers (hs indices): {hs_indices} "
             f"of total_layers={total_layers}; kept {max_k} blocks"
         )
 
-        self.set_trainable_parameters(
-            tune_llm, tune_visual, tune_top_llm_layers, print_params=False
+        self.tune_llm = tune_llm
+        self.tune_visual = tune_visual
+        self.lora = None
+        self._set_trainable_parameters(tune_top_llm_layers, freeze_cog_tokens)
+
+    def apply_lora(self, lora: BackboneLoraConfig) -> None:
+        """Only the adapters train: the whole backbone freezes first, whatever the tune flags."""
+        self.lora = lora
+        self.requires_grad_(False)
+        total = len(self.qwen_model.model.language_model.layers)
+        top = total if lora.num_layers == -1 else min(lora.num_layers, total)
+        inject_lora(
+            self,
+            lora,
+            lora.target_modules,
+            layers_to_transform=list(range(total - top, total)),
+            layers_pattern="layers",
         )
-        if load_bf16 and trainable_params_fp32:
-            for n, p in self.named_parameters():
-                if p.requires_grad:
-                    p.data = p.data.to(torch.float32)
-                    _print(f"Casting trainable parameter {n} to fp32")
 
     def _init_cog_token_modules(self, feature_dim: int) -> None:
         if self.cog_mode not in {"full", "cog_only"}:
             raise ValueError(f"Unsupported cog_mode '{self.cog_mode}' for VTC backbone.")
         if self.n_cog_tokens <= 0:
-            raise ValueError("`n_cog_tokens` must be > 0 when `use_cog_tokens` is enabled.")
+            raise ValueError("`n_cog_tokens` must be > 0.")
         self.cog_emb = nn.Parameter(torch.randn(self.n_cog_tokens, feature_dim) * 0.02)
 
         _print("\n[i] cog_emb initialized in VTCQwen3VLBackbone:")
@@ -216,72 +280,37 @@ class VTCQwen3VLBackbone(nn.Module):
             else:
                 raise
 
-    def set_trainable_parameters(
-        self,
-        tune_llm: bool,
-        tune_visual: bool,
-        tune_top_llm_layers: int = 0,
-        print_params: bool = True,
-    ):
-        self.tune_llm = tune_llm
-        self.tune_visual = tune_visual
+    def _set_trainable_parameters(self, tune_top_llm_layers: int, freeze_cog_tokens: bool):
         for p in self.parameters():
             p.requires_grad = True
-        if not tune_llm:
+        if not self.tune_llm:
             self.qwen_model.model.language_model.requires_grad_(False)
             self.qwen_model.lm_head.requires_grad_(False)
-        if not tune_visual:
+        if not self.tune_visual:
             self.qwen_model.model.visual.requires_grad_(False)
             # Unfreeze motion module block even when visual is frozen
-            if (
-                hasattr(self.qwen_model.model.visual, "motion_block")
-                and self.qwen_model.model.visual.motion_block is not None
-            ):
+            if self.qwen_model.model.visual.motion_block is not None:
                 self.qwen_model.model.visual.motion_block.requires_grad_(True)
 
         if tune_top_llm_layers > 0:
-            for layer in self.qwen_model.model.language_model.layers[-tune_top_llm_layers:]:
-                for param in layer.parameters():
-                    param.requires_grad = True
+            self.qwen_model.model.language_model.layers[-tune_top_llm_layers:].requires_grad_(True)
+        if freeze_cog_tokens:
+            self.cog_emb.requires_grad_(False)
+            _print("[i] freeze_cog_tokens: cog_emb frozen (requires_grad=False)")
 
-        if print_params:
-            _print("=" * 50)
-            _print(f"[i] Tune backbone llm: {self.tune_llm}")
-            _print(f"[i] Tune backbone vision tower: {self.tune_visual}")
-            if tune_top_llm_layers > 0:
-                _print(f"[i] Tune top {tune_top_llm_layers} LLM layers")
-            _print("=" * 50 + "\n")
+    def restore_frozen_modes(self) -> None:
+        if not self.training:
+            return
+        if self.lora is not None or not self.tune_llm:
+            self.qwen_model.eval()
+        elif not self.tune_visual:
+            self.qwen_model.model.visual.eval()
 
-            trainable_params = 0
-            total_params = 0
-            trainable_param_names = []
-            for name, p in self.named_parameters():
-                total_params += p.numel()
-                if p.requires_grad:
-                    trainable_params += p.numel()
-                    trainable_param_names.append(name)
-
-            _print(
-                f"[i] Backbone trainable parameters: {trainable_params:,} / {total_params:,} "
-                f"({100 * trainable_params / total_params:.2f}%)"
-            )
-
-            if not tune_llm and not tune_visual:
-                for name in trainable_param_names:
-                    _print(f"[i] Backbone trainable parameter: {name}")
-            if trainable_params == 0:
-                _print("[w] No backbone trainable parameters found.")
-
-    def set_frozen_modules_to_eval_mode(self):
-        if self.training:
-            if self.qwen_model and not self.tune_llm:
-                self.qwen_model.eval()
-            if self.qwen_model.model.visual and not self.tune_visual:
-                self.qwen_model.model.visual.eval()
-            # motion module block must stay in train mode for correct BatchNorm behavior
-            motion_block = getattr(self.qwen_model.model.visual, "motion_block", None)
-            if motion_block is not None:
-                motion_block.train()
+        # The motion block is the trainable exception inside the otherwise
+        # frozen vision subtree and needs BatchNorm updates during training.
+        motion_block = self.qwen_model.model.visual.motion_block
+        if motion_block is not None:
+            motion_block.train()
 
     def _process_moss_features(self, moss_feats, moss_meta):
         """Process saved motion module features for vl_input injection: spatial pool + projection.
@@ -318,10 +347,30 @@ class VTCQwen3VLBackbone(nn.Module):
         moss_feats = self.moss_proj(moss_feats)
         return moss_feats
 
-    def prepare_input(self, batch: dict) -> BatchFeature:
-        return BatchFeature(data=batch)
+    @property
+    def input_spec(self) -> Qwen3VLInputSpec:
+        """Describe host preprocessing without exposing the model to its collator."""
+        if self.moss_proj is not None:
+            raise ValueError(
+                "motion_injection_point='vl_input' is incompatible with the canonical "
+                "host token-compression plan; use motion_injection_point='vision_encoder'"
+            )
+        qwen_model = self.qwen_model.model
+        config = qwen_model.config
+        if len(config.vision_config.deepstack_visual_indexes) > COMPRESSION_LAYER:
+            raise ValueError("DeepStack injection must finish before token compression")
+        return Qwen3VLInputSpec(
+            n_cog_tokens=self.n_cog_tokens,
+            spatial_merge_size=config.vision_config.spatial_merge_size,
+            vision_max_seqlen=qwen_model.visual.vision_max_seqlen,
+            image_token_id=config.image_token_id,
+            video_token_id=config.video_token_id,
+            vision_start_token_id=config.vision_start_token_id,
+            compression_pattern_token_id=config.vision_start_token_id,
+            motion_layout=("uniform" if qwen_model.visual.motion_block is not None else "disabled"),
+        )
 
-    def _forward_qwen_with_cog_tokens(self, qwen_input: dict):
+    def _forward_qwen_with_cog_tokens(self, qwen_input: PreparedQwen3VLInputs):
         # Unwrap the qwen_input dictionary
         input_ids = qwen_input.get("input_ids", None)
         attention_mask = qwen_input.get("attention_mask", None)
@@ -333,9 +382,11 @@ class VTCQwen3VLBackbone(nn.Module):
         image_grid_thw = qwen_input.get("image_grid_thw", None)
         video_grid_thw = qwen_input.get("video_grid_thw", None)
         cache_position = qwen_input.get("cache_position", None)
-        image_wise_encoding = qwen_input.get("image_wise_encoding", None)
-        num_views = qwen_input.get("num_views", None)
-        num_frames = qwen_input.get("num_frames", None)
+        host_layout = qwen_input.get("host_layout", {})
+        vision_layout = qwen_input.get("vision_layout")
+        compression = qwen_input.get("compression")
+        token_compression_plan = compression.plan if compression is not None else None
+        compressed_attention_mask = compression.attention_mask if compression is not None else None
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -349,22 +400,18 @@ class VTCQwen3VLBackbone(nn.Module):
 
         # Build motion module kwargs for get_image_features
         moss_kwargs = {}
-        if num_frames is not None:
-            moss_kwargs["num_frames"] = (
-                int(num_frames[0]) if isinstance(num_frames, torch.Tensor) else int(num_frames)
-            )
-        if num_views is not None:
-            moss_kwargs["num_views"] = (
-                int(num_views[0]) if isinstance(num_views, torch.Tensor) else int(num_views)
-            )
+        if "num_frames" in host_layout:
+            moss_kwargs["num_frames"] = host_layout["num_frames"]
+        if "num_views" in host_layout:
+            moss_kwargs["num_views"] = host_layout["num_views"]
 
         if pixel_values is not None:
             image_embeds, deepstack_image_embeds = self.qwen_model.model.get_image_features(
-                pixel_values, image_grid_thw, **moss_kwargs
+                pixel_values, image_grid_thw, vision_layout=vision_layout, **moss_kwargs
             )
             image_embeds = torch.cat(image_embeds, dim=0).to(device, inputs_embeds.dtype)
             image_mask, _ = self.qwen_model.model.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+                input_ids, inputs_embeds=inputs_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
@@ -374,7 +421,7 @@ class VTCQwen3VLBackbone(nn.Module):
             )
             video_embeds = torch.cat(video_embeds, dim=0).to(device, inputs_embeds.dtype)
             _, video_mask = self.qwen_model.model.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+                input_ids, inputs_embeds=inputs_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
@@ -418,7 +465,7 @@ class VTCQwen3VLBackbone(nn.Module):
                 visual._moss_meta = None
 
         bsz = inputs_embeds.size(0)
-        placeholder_token_id = 248068
+        placeholder_token_id = COG_PLACEHOLDER_TOKEN_ID
 
         ### Insert motion module tokens BEFORE image tokens (for causal attention benefit)
         # Sequence: [text | motion module | images | trailing] + [meta_queries]
@@ -431,10 +478,13 @@ class VTCQwen3VLBackbone(nn.Module):
             image_emb = inputs_embeds[:, first_img_pos:, :]
             inputs_embeds = torch.cat([text_emb, moss_tokens, image_emb], dim=1)
 
-            text_att = attention_mask[:, :first_img_pos]
-            image_att = attention_mask[:, first_img_pos:]
-            moss_att = torch.ones(bsz, n_motion_tokens, dtype=attention_mask.dtype, device=device)
-            attention_mask = torch.cat([text_att, moss_att, image_att], dim=1)
+            if attention_mask is not None:
+                text_att = attention_mask[:, :first_img_pos]
+                image_att = attention_mask[:, first_img_pos:]
+                moss_att = torch.ones(
+                    bsz, n_motion_tokens, dtype=attention_mask.dtype, device=device
+                )
+                attention_mask = torch.cat([text_att, moss_att, image_att], dim=1)
 
             text_ids = input_ids[:, :first_img_pos]
             image_ids = input_ids[:, first_img_pos:]
@@ -455,9 +505,12 @@ class VTCQwen3VLBackbone(nn.Module):
         meta_raw = self.cog_emb.to(inputs_embeds.dtype).unsqueeze(0).expand(bsz, -1, -1)
         full_emb = torch.cat([inputs_embeds, meta_raw], dim=1)
 
-        ### Extend attention_mask for cognition tokens
-        meta_ones = torch.ones(bsz, self.n_cog_tokens, dtype=attention_mask.dtype, device=device)
-        full_att_mask = torch.cat([attention_mask, meta_ones], dim=1)
+        ### Extend input_ids and attention_mask for cognition tokens. The training
+        ### collator precomputes position_ids by replaying this exact extension, so
+        ### both sides call the same function.
+        extended_input_ids, full_att_mask = extend_for_cog_tokens(
+            input_ids, attention_mask, self.n_cog_tokens, placeholder_token_id
+        )
 
         ### Extend visual_pos_masks for cognition tokens
         if visual_pos_masks is not None:
@@ -466,16 +519,14 @@ class VTCQwen3VLBackbone(nn.Module):
             )
             visual_pos_masks = torch.cat([visual_pos_masks, vis_pad], dim=1)
 
-        ### Extend input_ids with placeholder tokens
-        meta_ids = torch.full(
-            (bsz, self.n_cog_tokens),
-            placeholder_token_id,
-            dtype=input_ids.dtype,
-            device=device,
-        )
-        extended_input_ids = torch.cat([input_ids, meta_ids], dim=1)
-
         # ── 3D position_ids (mirrors Qwen3VLModel.forward) ──
+        if position_ids is not None and (
+            position_ids.ndim != 3 or position_ids.shape[-2:] != full_emb.shape[:2]
+        ):
+            raise ValueError(
+                f"precomputed position_ids {tuple(position_ids.shape)} do not cover the "
+                f"cog-extended sequence (3, {full_emb.shape[0]}, {full_emb.shape[1]})"
+            )
         if position_ids is None:
             attention_mask_tensor = (
                 full_att_mask
@@ -540,15 +591,20 @@ class VTCQwen3VLBackbone(nn.Module):
             cache_position=cache_position,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
-            output_hidden_states=True,
-            image_wise_encoding=image_wise_encoding,
-            num_views=num_views,
+            deepstack_plan=qwen_input["deepstack_plan"],
             motion_drop_info=motion_drop_info,
+            token_compression_plan=token_compression_plan,
+            compressed_attention_mask=compressed_attention_mask,
+            text_attention=qwen_input.get("text_attention"),
+            attention_mask_is_canonical=True,
         )
 
         return outputs.last_hidden_state, full_att_mask
 
     def forward_qwen(self, vl_input: BatchFeature) -> BatchFeature:
+        # Shape normalization is local execution state. Never rewrite the
+        # planner-owned input mapping passed across the model boundary.
+        vl_input = BatchFeature(data=dict(vl_input))
         if "pixel_values" in vl_input and vl_input["pixel_values"].ndim == 3:
             pv = vl_input["pixel_values"]
             vl_input["pixel_values"] = pv.reshape(-1, pv.shape[-1])
@@ -563,46 +619,24 @@ class VTCQwen3VLBackbone(nn.Module):
             image_token_id = self.qwen_model.model.config.image_token_id
             image_mask = vl_input["input_ids"] == image_token_id  # [B, L]
 
-        if self.use_cog_tokens:
-            last_hs, attn_mask = self._forward_qwen_with_cog_tokens(vl_input)
+        last_hs, attn_mask = self._forward_qwen_with_cog_tokens(vl_input)
 
-            if self.cog_mode == "cog_only":
-                features = last_hs[:, -self.n_cog_tokens :, :]
-                attn_mask = attn_mask[:, -self.n_cog_tokens :]
-                if image_mask is not None:
-                    image_mask = image_mask[:, -self.n_cog_tokens :]
-            else:
-                features = last_hs
-
-            features = self.qwen_linear(features)
-            return features, attn_mask, image_mask
+        if self.cog_mode == "cog_only":
+            features = last_hs[:, -self.n_cog_tokens :, :]
+            # Cog tokens are appended as always-valid. Preserve the
+            # canonical None-or-genuinely-padded mask contract.
+            attn_mask = None
+            if image_mask is not None:
+                image_mask = image_mask[:, -self.n_cog_tokens :]
         else:
-            qwen_output = self.qwen_model(**vl_input, output_hidden_states=True, return_dict=True)
-            attn_mask = vl_input["attention_mask"]
+            features = last_hs
 
-            hs = qwen_output.hidden_states
-            selected_indices = [self._hs_idx(i) for i in self.select_layers]
-            feats = [hs[idx] for idx in selected_indices]
-
-            linearized = [self.qwen_linear(feat) for feat in feats]
-            features = linearized[0] if len(linearized) == 1 else linearized
-            return features, attn_mask, image_mask
+        features = self.qwen_linear(features)
+        return features, attn_mask, image_mask
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
-        self.set_frozen_modules_to_eval_mode()
-        keys_to_use = [
-            "input_ids",
-            "attention_mask",
-            "pixel_values",
-            "image_grid_thw",
-            "image_wise_encoding",
-            "num_views",
-        ]
-        filtered = {k: vl_input[k] for k in keys_to_use}
-        if "num_frames" in vl_input:
-            filtered["num_frames"] = vl_input["num_frames"]
-        vl_input = filtered
-        outputs, attention_mask, image_mask = self.forward_qwen(vl_input)
+        qwen_input = project_qwen3vl_inputs(vl_input)
+        outputs, attention_mask, image_mask = self.forward_qwen(qwen_input)
 
         return BatchFeature(
             data={

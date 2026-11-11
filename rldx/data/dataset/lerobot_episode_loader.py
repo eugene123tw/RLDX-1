@@ -35,6 +35,7 @@ Returns messages with VLAStepData as defined in types.py.
 """
 
 from collections import defaultdict
+from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
@@ -44,9 +45,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from rldx.data.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
 from rldx.data.types import ModalityConfig
-from rldx.utils.initial_actions import INITIAL_ACTIONS_FILENAME, load_initial_actions
-from rldx.utils.video_utils import get_frames_by_indices
+from rldx.data.video import decode_video_frames
+from rldx.telemetry.train_metrics import LOADER_METRICS
 
 
 # LeRobot standard metadata filenames
@@ -81,6 +83,22 @@ def _to_plain_dict(tree):
     return tree
 
 
+@dataclass(frozen=True)
+class _VideoSource:
+    """A selected camera bound to its dataset key and file pattern."""
+
+    view: str
+    original_key: str
+    path_pattern: str
+
+    def filename(self, episode_index: int, episode_chunk: int) -> str:
+        return self.path_pattern.format(
+            video_key=self.original_key,
+            episode_index=episode_index,
+            episode_chunk=episode_chunk,
+        )
+
+
 class LeRobotEpisodeLoader:
     """
     Episode-level data loader for LeRobot format datasets.
@@ -100,8 +118,7 @@ class LeRobotEpisodeLoader:
         dataset_path: Path to dataset root directory containing meta/ and data files
         modality_configs: Dictionary mapping modality names to ModalityConfig objects
                          that specify temporal sampling and data keys to load
-        video_backend: Video decoding backend ('torchcodec', 'decord', etc.)
-        video_backend_kwargs: Additional arguments for the video backend
+        num_ffmpeg_threads: FFmpeg threads per decoder.
 
     Example:
         >>> loader = LeRobotEpisodeLoader(
@@ -121,8 +138,7 @@ class LeRobotEpisodeLoader:
         self,
         dataset_path: str | Path,
         modality_configs: dict[str, ModalityConfig],
-        video_backend: str = "torchcodec",
-        video_backend_kwargs: dict[str, Any] | None = None,
+        num_ffmpeg_threads: int = 1,
     ) -> None:
         """
         Initialize LeRobot episode loader with dataset path and modality configurations.
@@ -133,8 +149,7 @@ class LeRobotEpisodeLoader:
         3. Computing effective episode lengths based on action horizon
         """
         self.dataset_path = Path(dataset_path)
-        self.video_backend = video_backend
-        self.video_backend_kwargs = video_backend_kwargs
+        self.num_ffmpeg_threads = num_ffmpeg_threads
 
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Dataset path does not exist: {self.dataset_path}")
@@ -144,20 +159,20 @@ class LeRobotEpisodeLoader:
 
         # Set up modality configs after metadata is loaded
         self.modality_configs = self._parse_and_validate_modality_configs(modality_configs)
+        self._video_sources = self._parse_video_sources()
 
         # Compute effective episode lengths accounting for action horizon
         self.episode_lengths = self.get_episode_lengths()
 
     def _load_metadata(self) -> None:
         """
-        Load all metadata files including dataset statistics.
+        Load all metadata files except the statistics, read only by get_dataset_statistics.
 
         Parses the standard LeRobot metadata structure:
         - info.json: Dataset configuration and file patterns
         - episodes.jsonl: Per-episode metadata (length, timestamps, etc.)
         - tasks.jsonl: Task descriptions and mappings
         - modality.json: Modality structure and data layout
-        - stats.json: Dataset statistics for normalization
         """
         meta_dir = self.dataset_path / LEROBOT_META_DIR_NAME
 
@@ -182,23 +197,9 @@ class LeRobotEpisodeLoader:
         with open(modality_path, "r") as f:
             self.modality_meta = json.load(f)
 
-        # Load dataset statistics for normalization
-        stats_path = meta_dir / LEROBOT_STATS_FILE_NAME
-        assert stats_path.exists(), (
-            f"{stats_path} does not exist for {self.dataset_path}, please use rldx/data/stats.py to generate it"
-        )
-        with open(stats_path, "r") as f:
-            self.stats = json.load(f)
-
-        relative_stats_path = meta_dir / LEROBOT_RELATIVE_STATS_FILE_NAME
-        if relative_stats_path.exists():
-            with open(relative_stats_path, "r") as f:
-                self.stats["relative_action"] = json.load(f)
-
         # Extract key configuration parameters
         self.feature_config = self.info_meta.get("features", {})
         self.data_path_pattern = self.info_meta["data_path"]
-        self.video_path_pattern = self.info_meta.get("video_path")
         self.chunk_size = self.info_meta["chunks_size"]
         self.fps = self.info_meta.get("fps", 30)
 
@@ -252,15 +253,69 @@ class LeRobotEpisodeLoader:
         # Validate remaining modality configurations
         for modality in modality_configs:
             if modality == "language":
-                # Language modality has special constraints
-                assert len(modality_configs[modality].modality_keys) == 1, (
-                    "Language modality must have exactly one key"
+                # Language modality has special constraints.
+                # Some embodiments (e.g. OXE_DROID) define multiple language keys for
+                # training-time augmentation. At inference we only use the first key.
+                assert len(modality_configs[modality].modality_keys) >= 1, (
+                    "Language modality must have at least one key"
                 )
+                if len(modality_configs[modality].modality_keys) > 1:
+                    logging.warning(
+                        f"Language modality has {len(modality_configs[modality].modality_keys)} keys, "
+                        f"only the first key will be used: {modality_configs[modality].modality_keys[0]}"
+                    )
+                    modality_configs = dict(modality_configs)
+                    modality_configs[modality] = ModalityConfig(
+                        delta_indices=modality_configs[modality].delta_indices,
+                        modality_keys=[modality_configs[modality].modality_keys[0]],
+                        sin_cos_embedding_keys=modality_configs[modality].sin_cos_embedding_keys,
+                        mean_std_embedding_keys=modality_configs[modality].mean_std_embedding_keys,
+                        action_configs=modality_configs[modality].action_configs[:1]
+                        if modality_configs[modality].action_configs is not None
+                        else None,
+                    )
                 assert modality_configs[modality].delta_indices == [0], (
                     "Only single timestep is supported for language modality"
                 )
 
         return modality_configs
+
+    def _parse_video_sources(self) -> tuple[_VideoSource, ...]:
+        """Bind selected cameras once; episode loading only fills in episode coordinates."""
+        video_config = self.modality_configs.get("video")
+        if video_config is None or not video_config.modality_keys:
+            return ()
+
+        path_pattern = self.info_meta.get("video_path")
+        if not isinstance(path_pattern, str) or not path_pattern:
+            raise ValueError(
+                f"Dataset {self.dataset_path}: selected video views require a nonempty video_path"
+            )
+
+        sources = []
+        for view in video_config.modality_keys:
+            try:
+                view_meta = self.modality_meta["video"][view]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Dataset {self.dataset_path}: video view {view!r} is missing from modality.json"
+                ) from exc
+            original_key = view_meta.get("original_key", f"observation.images.{view}")
+            if original_key not in self.feature_config:
+                raise ValueError(
+                    f"Dataset {self.dataset_path}: video view {view!r} references "
+                    f"feature {original_key!r} missing from info.json"
+                )
+            source = _VideoSource(view, original_key, path_pattern)
+            try:
+                source.filename(episode_index=0, episode_chunk=0)
+            except (KeyError, IndexError, ValueError) as exc:
+                raise ValueError(
+                    f"Dataset {self.dataset_path}: invalid video_path {path_pattern!r} "
+                    f"for view {view!r}"
+                ) from exc
+            sources.append(source)
+        return tuple(sources)
 
     def __len__(self) -> int:
         """Return number of episodes in dataset."""
@@ -358,21 +413,26 @@ class LeRobotEpisodeLoader:
                     )
                     # print(f"[DEBUG @ lerobot_episode_loader.py] after {loaded_df[f'language.{key}'].iloc[0]}")
 
-        # Extract joint groups for state, action, and any physics modalities
-        # All non-video, non-language modalities with column data are extracted here.
+        # Extract joint groups for state, action, and any physics modalities.
         numerical_modalities = [m for m in self.modality_configs if m not in ("video", "language")]
         for modality_type in numerical_modalities:
             if modality_type not in self.modality_configs:
                 continue
             joint_groups_df = self._extract_joint_groups(
-                original_df, self.modality_configs[modality_type].modality_keys, modality_type
+                original_df,
+                self.modality_configs[modality_type].modality_keys,
+                modality_type,
             )
             for joint_group in joint_groups_df.columns:
                 loaded_df[f"{modality_type}.{joint_group}"] = joint_groups_df[joint_group]
 
         return loaded_df
 
-    def _load_video_data(self, episode_index: int, indices: np.ndarray) -> dict[str, np.ndarray]:
+    def _load_video_data(
+        self,
+        episode_index: int,
+        indices: np.ndarray,
+    ) -> dict[str, np.ndarray]:
         """
         Load video data for all configured camera views at specified indices.
 
@@ -388,49 +448,32 @@ class LeRobotEpisodeLoader:
         """
         video_data = {}
 
-        if not self.video_path_pattern or "video" not in self.modality_configs:
+        if not self._video_sources:
+            return video_data
+
+        indices = np.asarray(indices, dtype=np.int64)
+        if len(indices) == 0:
             return video_data
 
         chunk_idx = episode_index // self.chunk_size
-        image_keys = self.modality_configs["video"].modality_keys
-        try:  # DEBUG
-            for image_key in image_keys:
-                # Resolve the original key used in video file naming
-                original_key = self.modality_meta["video"][image_key].get(
-                    "original_key", f"observation.images.{image_key}"
-                )
-                assert original_key in self.feature_config, (
-                    f"Original key {original_key} not found in feature config"
-                )
+        for source in self._video_sources:
+            video_path = self.dataset_path / source.filename(episode_index, chunk_idx)
 
-                # Construct video file path using pattern
-                video_filename = self.video_path_pattern.format(
-                    episode_chunk=chunk_idx, video_key=original_key, episode_index=episode_index
-                )
-                video_path = self.dataset_path / video_filename
+            try:
+                with LOADER_METRICS.timed(LOADER_METRICS.view_decode):
+                    frames = decode_video_frames(
+                        str(video_path),
+                        indices,
+                        num_ffmpeg_threads=self.num_ffmpeg_threads,
+                    )
+            except Exception as exc:
+                raise RuntimeError(
+                    "video decode failed: "
+                    f"episode={episode_index}, view={source.view!r}, path={video_path}, "
+                    f"indices={indices.tolist()}"
+                ) from exc
 
-                # Decode video frames at specified timestamps
-                video_data[image_key] = get_frames_by_indices(
-                    str(video_path),
-                    indices,
-                    video_backend=self.video_backend,
-                    video_backend_kwargs=self.video_backend_kwargs or {},
-                )
-        except Exception as e:
-            import logging
-
-            logging.error(
-                "lerobot_episode_loader video load failed: image_keys=%r, "
-                "problem_image_key=%r, video_path_pattern=%r, dataset_path=%r, "
-                "indices=%r, error=%s",
-                image_keys,
-                image_key,
-                self.video_path_pattern,
-                self.dataset_path,
-                indices,
-                e,
-            )
-            raise e
+            video_data[source.view] = frames
 
         return video_data
 
@@ -445,6 +488,14 @@ class LeRobotEpisodeLoader:
         Returns:
             Nested dictionary: {modality: {joint_group: {stat_type: values}}}
         """
+        meta_dir = self.dataset_path / LEROBOT_META_DIR_NAME
+        with open(meta_dir / LEROBOT_STATS_FILE_NAME) as f:
+            raw_stats = json.load(f)
+        relative_stats_path = meta_dir / LEROBOT_RELATIVE_STATS_FILE_NAME
+        if relative_stats_path.exists():
+            with open(relative_stats_path) as f:
+                raw_stats["relative_action"] = json.load(f)
+
         # Build mapping dynamically: core modalities + any physics modalities in config
         mapping = dict(DEFAULT_COLUMN_NAMES)  # state, action
         for m in self.modality_configs:
@@ -465,14 +516,14 @@ class LeRobotEpisodeLoader:
                     self.modality_meta[modality][joint_key]["start"],
                     self.modality_meta[modality][joint_key]["end"],
                 )
-                for stat_type in self.stats[stats_key].keys():  # mean, std, min, max, q01, q99
-                    dataset_statistics[modality][joint_key][stat_type] = self.stats[stats_key][
+                for stat_type in raw_stats[stats_key].keys():  # mean, std, min, max, q01, q99
+                    dataset_statistics[modality][joint_key][stat_type] = raw_stats[stats_key][
                         stat_type
                     ][start_idx:end_idx]
         stats = _to_plain_dict(dataset_statistics)
         # Directly add relative action stats
-        if "relative_action" in self.stats:
-            stats["relative_action"] = self.stats["relative_action"]
+        if "relative_action" in raw_stats:
+            stats["relative_action"] = raw_stats["relative_action"]
         return stats
 
     def create_language_from_meta(
@@ -487,7 +538,11 @@ class LeRobotEpisodeLoader:
             new_languages = [[] for _ in range(nframes)]
             sub_tasks = episode_meta["sub_tasks"]
             for sub_task in sub_tasks:
-                start_idx, end_idx, sub_text = sub_task["start"], sub_task["end"], sub_task["text"]
+                start_idx, end_idx, sub_text = (
+                    sub_task["start"],
+                    sub_task["end"],
+                    sub_task["text"],
+                )
                 horizon = action_horizon // 2
                 for i in range(start_idx - horizon, end_idx):
                     if i < 0:
@@ -499,7 +554,11 @@ class LeRobotEpisodeLoader:
             raise ValueError(f"Language key {lang_key} not supported")
         return new_languages
 
-    def __getitem__(self, idx: int) -> pd.DataFrame:
+    def load_episode(
+        self,
+        idx: int,
+        video_indices: np.ndarray | None = None,
+    ) -> pd.DataFrame:
         """
         Load complete episode data as a processed DataFrame.
 
@@ -509,6 +568,7 @@ class LeRobotEpisodeLoader:
 
         Args:
             idx: Episode index to load
+            video_indices: Shared frame indices for all views; None loads the full episode.
 
         Returns:
             DataFrame with columns for all modalities and timestamps, with video frames
@@ -525,7 +585,8 @@ class LeRobotEpisodeLoader:
         nominal_length = episode_meta["length"]
 
         # Load and parse the parquet data
-        df = self._load_parquet_data(episode_id)
+        with LOADER_METRICS.timed(LOADER_METRICS.parquet):
+            df = self._load_parquet_data(episode_id)
 
         if "language" in self.modality_configs:
             lang_key = self.modality_configs["language"].modality_keys[0]
@@ -538,16 +599,33 @@ class LeRobotEpisodeLoader:
         df = df.iloc[:actual_length]
 
         # Load synchronized video data
-        video_data = self._load_video_data(episode_id, np.arange(actual_length))
+        if video_indices is None:
+            requested_video_indices = np.arange(actual_length)
+        else:
+            requested_video_indices = np.unique(np.clip(video_indices, 0, actual_length - 1))
+        video_data = self._load_video_data(episode_id, requested_video_indices)
 
         # Add video frames to dataframe as PIL Images
-        for key in video_data.keys():
-            assert len(video_data[key]) == len(df), (
-                f"Video data for {key} has length {len(video_data[key])} but dataframe has length {len(df)}"
-            )
-            df[f"video.{key}"] = [frame for frame in video_data[key]]
+        for key, frames in video_data.items():
+            if video_indices is None:
+                assert len(frames) == len(df), (
+                    f"Video data for {key} has length {len(frames)} but dataframe has length {len(df)}"
+                )
+                df[f"video.{key}"] = [frame for frame in frames]
+                continue
+
+            frame_indices = np.asarray(requested_video_indices, dtype=np.int64)
+            assert len(frames) == len(frame_indices)
+            sparse_frames = pd.Series([None] * len(df), index=df.index, dtype=object)
+            for frame_index, frame in zip(frame_indices, frames):
+                sparse_frames.iloc[int(frame_index)] = frame
+            df[f"video.{key}"] = sparse_frames
 
         return df
+
+    def __getitem__(self, idx: int) -> pd.DataFrame:
+        """Load a complete episode, preserving the historical public path."""
+        return self.load_episode(idx)
 
     def get_initial_actions(self):
         """

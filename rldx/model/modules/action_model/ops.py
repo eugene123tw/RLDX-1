@@ -1,4 +1,10 @@
-"""MSAT utility ops: RoPE, TimestepEncoder, SwiGLUFFN, head utils (extracted from msat.py)."""
+"""MSAT utility ops: RoPE, TimestepEncoder, SwiGLUFFN, head utils (extracted from msat.py).
+
+``TimestepEncoder`` (NVIDIA Isaac GR00T) and ``SwiGLUFFN`` (Meta DINOv2, via
+LightningDiT) are vendored from upstream projects and carry their attribution in their
+own docstrings. Neither upstream file is reproduced here as a whole, so each notice sits
+on the symbol it covers rather than in a file-level copyright header.
+"""
 
 from typing import Callable, Optional
 
@@ -9,40 +15,25 @@ import torch.nn.functional as F
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    """
-    Precompute RoPE frequencies in complex form (Llama style).
+    """Precompute interleaved RoPE as real 2-by-2 rotation matrices.
+
     Args:
         dim: Head dimension (must be even)
         end: Maximum sequence length
         theta: Base frequency parameter
+
     Returns:
-        Complex frequencies, shape (end, dim//2) as complex64
+        Rotation matrices, shape (end, dim//2, 2, 2) as float32.
     """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    """
-    Reshape freqs_cis for broadcasting with x (Llama style, adapted for our use case).
-    Args:
-        freqs_cis: Complex frequencies, shape (B, N, D//2) as complex64
-        x: Tensor to broadcast with, shape (B, H, N, D//2) as complex
-    Returns:
-        Reshaped freqs_cis for broadcasting, shape (B, 1, N, D//2)
-    """
-    ndim = x.ndim
-    assert ndim == 4, f"x should have 4 dims (B, H, N, D//2), got {ndim}"
-    assert freqs_cis.ndim == 3, f"freqs_cis should have 3 dims (B, N, D//2), got {freqs_cis.ndim}"
-    assert freqs_cis.shape == (x.shape[0], x.shape[2], x.shape[-1]), (
-        f"freqs_cis shape {freqs_cis.shape} != (B={x.shape[0]}, N={x.shape[2]}, D//2={x.shape[-1]})"
-    )
-
-    # Reshape to (B, 1, N, D//2) for broadcasting with (B, H, N, D//2)
-    return freqs_cis.unsqueeze(1)
+    assert dim % 2 == 0, f"dim must be even (dimensions rotate in pairs), got {dim}"
+    rates = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    positions = torch.arange(end, dtype=torch.float32)
+    angles = positions[:, None] * rates[None, :]
+    # Preserve the existing table bits; separate cos/sin calls can differ by one ULP.
+    freqs_cis = torch.exp(torch.complex(torch.zeros_like(angles), angles))
+    return torch.stack(
+        (freqs_cis.real, -freqs_cis.imag, freqs_cis.imag, freqs_cis.real), dim=-1
+    ).reshape(end, dim // 2, 2, 2)
 
 
 def apply_rotary_emb(
@@ -50,26 +41,40 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply RoPE rotation to Q and K tensors using complex multiplication (Llama style).
+    """Apply interleaved RoPE to Q and K with real rotation matrices.
+
     Args:
         xq: Query tensor, shape (B, H, N, D) where D=head_dim
         xk: Key tensor, shape (B, H, N, D) where D=head_dim
-        freqs_cis: Complex frequencies, shape (N, D//2) or (1, N, D//2) as complex64
+        freqs_cis: Rotation matrices, shape (B, N, D//2, 2, 2)
+
     Returns:
-        Rotated Q and K tensors
+        Rotated Q and K, in the dtype they came in as
+
+    Follows FLUX's ``apply_rope``:
+    https://github.com/black-forest-labs/flux, src/flux/math.py
+
+    FLUX is licensed under the Apache License, Version 2.0. The upstream file carries no
+    copyright line, so none is reproduced here. Modified from the original, per Section
+    4(b): the shape checks, the head axis added to ``freqs_cis``, and the reshape folded
+    into each rotation.
     """
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    assert xq.ndim == 4 and xk.ndim == 4, "q and k must have shape (B, H, N, D)"
+    assert xq.shape == xk.shape, f"q shape {xq.shape} != k shape {xk.shape}"
+    expected = (xq.shape[0], xq.shape[2], xq.shape[-1] // 2, 2, 2)
+    assert freqs_cis.shape == expected, f"freqs_cis shape {freqs_cis.shape} != {expected}"
+
+    freqs_cis = freqs_cis.unsqueeze(1)
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+    xq_out = (freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]).reshape(xq.shape)
+    xk_out = (freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]).reshape(xk.shape)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
 class RoPEEmbedder1D(nn.Module):
     """
-    Generate RoPE embeddings for 1D sequences with multiple axes (Llama style).
+    Generate real RoPE rotation matrices for 1D sequences with multiple axes.
     For joint_attn_v2:
     - rope_sa_only: Axis 0 (dim=16) = 0 (unused), Axis 1 (dim=48) = SA sequence position (includes time tokens and action tokens)
       * Time tokens: axis 1 = 0..num_temb_tokens-1
@@ -96,10 +101,20 @@ class RoPEEmbedder1D(nn.Module):
 
         for i, axis_dim in enumerate(axes_dim):
             freqs_cis = precompute_freqs_cis(axis_dim, max_seq_len, theta)
-            # persistent=False: safetensors cannot serialize complex dtypes
-            # (C64/C128) and these buffers are a deterministic function of
-            # (axis_dim, max_seq_len, theta) — rebuilt on every module init.
+            # These buffers are a deterministic function of the constructor
+            # arguments and are rebuilt on every module initialization.
             self.register_buffer(f"freqs_cis_{i}", freqs_cis, persistent=False)
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        for i, axis_dim in enumerate(self.axes_dim):
+            device = getattr(self, f"freqs_cis_{i}").device
+            setattr(
+                self,
+                f"freqs_cis_{i}",
+                precompute_freqs_cis(axis_dim, self.max_seq_len, self.theta).to(device),
+            )
+        return self
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         """
@@ -116,11 +131,28 @@ class RoPEEmbedder1D(nn.Module):
             freqs = freqs_cis[pos_ids]
             freqs_list.append(freqs)
 
-        return torch.cat(freqs_list, dim=-1)
+        return torch.cat(freqs_list, dim=-3)
 
 
 # Encoders ================================================
 class TimestepEncoder(nn.Module):
+    """
+    Copied verbatim from NVIDIA Isaac GR00T, down to the unused ``compute_dtype`` arg:
+    https://github.com/NVIDIA/Isaac-GR00T/blob/23ace64f17aa5015259b8609d371eb61a357c776/gr00t/model/modules/dit.py#L61-L71
+
+    At that revision GR00T is licensed under the Apache License, Version 2.0, and the
+    upstream file carries a copyright line, so it is reproduced here as Section 4(c)
+    requires:
+
+        Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+    The notice is deliberately here rather than in a file-level header: this module is
+    not a copy of any GR00T file, it borrows eleven lines from one, and a file-level
+    copyright line would assert NVIDIA's copyright over code they did not write. Other
+    single-symbol copies in this repository are annotated the same way -- see
+    ``quat2axisangle`` in rldx/eval/sim/LIBERO/libero_env.py.
+    """
+
     def __init__(self, embedding_dim, compute_dtype=torch.float32):
         super().__init__()
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=1)
@@ -136,7 +168,37 @@ class TimestepEncoder(nn.Module):
 # Normalization and FFN ================================================
 class SwiGLUFFN(nn.Module):
     """
-    SwiGLU feed-forward block from LightningDiT.
+    SwiGLU feed-forward block taken from LightningDiT, which vendored it from DINOv2.
+
+    Copied from DINOv2:
+    https://github.com/facebookresearch/dinov2/blob/81b2b6419385a321287de91e00282ef7cbd26f94/dinov2/layers/swiglu_ffn.py#L14-L34
+    Received via LightningDiT:
+    https://github.com/hustvl/LightningDiT/blob/0e483457f4f142f57c5ca164f7d172880e1055a6/models/swiglu_ffn.py#L15-L36
+
+    DINOv2 is licensed under the Apache License, Version 2.0, and the upstream file
+    carries a copyright line, so it is reproduced here as Section 4(c) requires. (Some
+    other upstreams vendored into this repository carry none, and no copyright line is
+    invented for those.)
+
+        Copyright (c) Meta Platforms, Inc. and affiliates.
+
+    Modified from the original, per Section 4(b), in two notational ways: ``act_layer``
+    is annotated ``Optional[Callable[..., nn.Module]]`` rather than
+    ``Callable[..., nn.Module]``, and ``forward`` spells ``torch.Tensor`` rather than the
+    imported ``Tensor``. The ``__init__`` and ``forward`` bodies are otherwise identical
+    to upstream, variable names (w12, w3, x12, x1, x2, hidden) included.
+
+    No LightningDiT notice is owed for this class. LightningDiT ships the file under
+    Meta's header, and its only change to the class is a ``@torch.compile`` decorator on
+    ``forward`` -- which this copy does not have. No HUST Vision Lab expression reaches
+    this file, so LightningDiT's own MIT license has nothing to attach to; the route is
+    recorded above only because it is how the code arrived, and because the original
+    one-line docstring named it.
+
+    The DINOv2 pin is 81b2b641 ("Update license everywhere", 2023-08-31). The class body
+    is byte-stable from ebc1cba1 (2023-08-30) through main, so the pin is not fragile;
+    81b2b641 is chosen because it is the revision that replaced the earlier "All rights
+    reserved" header with Apache-2.0, i.e. the license this copy is taken under.
     """
 
     def __init__(

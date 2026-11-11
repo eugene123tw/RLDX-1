@@ -19,16 +19,24 @@
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
+from omegaconf import OmegaConf
 import yaml
 
-from rldx.data.types import ActionConfig, ActionFormat, ActionRepresentation, ActionType
+from rldx.data.types import (
+    ActionConfig,
+    ActionFormat,
+    ActionRepresentation,
+    ActionType,
+    EpisodeBoundaryPolicy,
+)
+from rldx.data.utils import write_text_atomic
 
-from .data.data_config import DataConfig, SingleDatasetConfig
+from .data.data_config import DataConfig
 from .model import create_model_union_type, get_model_config
 from .model.rldx import RLDXConfig
-from .training.training_config import TrainingConfig
+from .training.runtime import TrainingConfig
 
 
 ModelUnionType = create_model_union_type()
@@ -43,52 +51,6 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
-    def save(self, path: Path):
-        """Save configuration to YAML file."""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(path, "w") as f:
-            yaml.dump(self, f)
-
-    def load(self, path: Path):
-        """Load configuration from YAML file."""
-        data = yaml.load(path.read_text(), Loader=yaml.Loader)
-        if isinstance(data, dict):  # for training
-            self.load_dict(data)
-        elif isinstance(data, self.__class__):
-            self = data
-        else:
-            raise ValueError(f"Invalid config file: {path}")
-        # config = cls(**config) # if yaml.dump(self.__dict__, ...) is used
-        return self
-
-    def load_dict(self, data: dict):
-        if "model" in data:
-            self.model = self.model.__class__(**data["model"])
-            import logging
-
-            logging.debug("base_config.load_dict: self.model=%r", self.model)
-        if "data" in data:
-            self.data = DataConfig(**data["data"])
-            # Ensure nested datasets are converted to dataclass instances
-            converted: List[SingleDatasetConfig] = []
-            for ds in self.data.datasets:
-                if isinstance(ds, dict):
-                    converted.append(SingleDatasetConfig(**ds))
-                else:
-                    converted.append(ds)
-            self.data.datasets = converted
-        if "training" in data:
-            self.training = TrainingConfig(**data["training"])
-        return self
-
-    @classmethod
-    def from_pretrained(cls, path: Path) -> "Config":
-        """Load configuration from YAML file."""
-        data = yaml.load(path.read_text(), Loader=yaml.Loader)
-        return data
-
     def get_deepspeed_config(self) -> dict:
         """Generate DeepSpeed configuration."""
         stage = self.training.deepspeed_stage
@@ -96,8 +58,6 @@ class Config:
         rldx_dir = Path(__file__).parent.parent
         if stage == 2:
             config = json.load(open(rldx_dir / "configs/deepspeed/zero2_config.json"))
-        elif stage == 3:
-            config = json.load(open(rldx_dir / "configs/deepspeed/zero3_config.json"))
         else:
             raise ValueError(f"Invalid DeepSpeed stage: {stage}")
 
@@ -115,7 +75,6 @@ class Config:
                 raise ValueError(f"Embodiment tag is empty for dataset {d_cfg.dataset_path}")
             if d_cfg.embodiment_tag is not None:
                 embodiment_tags.add(d_cfg.embodiment_tag)
-
         stripped_modality_configs = {}
         for embodiment_tag in embodiment_tags:
             stripped_modality_configs[embodiment_tag] = self.data.modality_configs[embodiment_tag]
@@ -138,10 +97,6 @@ class Config:
                     )
                 ] * len(self.data.modality_configs[embodiment_tag]["action"].modality_keys)
 
-        # Validate precision settings
-        if self.training.fp16 and self.training.bf16:
-            raise ValueError("Cannot use both fp16 and bf16")
-
 
 def get_default_config() -> Config:
     """Get default configuration."""
@@ -151,3 +106,50 @@ def get_default_config() -> Config:
 def get_config(model_type: str) -> Config:
     model_config_type = get_model_config(model_type)
     return Config(model=model_config_type())
+
+
+@dataclass(frozen=True)
+class RunRecord:
+    experiment_name: str
+    max_steps: int
+    # None: written before the field existed, so the policy is unknown.
+    episode_boundary_policy: EpisodeBoundaryPolicy | None
+
+
+def record_path(run_dir: Path | str) -> Path:
+    return Path(run_dir) / "experiment_cfg" / "conf.yaml"
+
+
+def write_run(config: Config, cfg_dir: Path, held_out: str | None) -> None:
+    record = OmegaConf.create(config.__dict__)
+    record["max_steps"] = config.training.max_steps
+    record["save_steps"] = config.training.save_steps
+    record["held_out"] = held_out
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(cfg_dir / "conf.yaml", OmegaConf.to_yaml(record, resolve=True))
+
+
+def read_run(run_dir: Path | str) -> RunRecord | None:
+    path = record_path(run_dir)
+    if not path.is_file():
+        return None
+    raw = yaml.safe_load(path.read_text())
+    return RunRecord(
+        experiment_name=raw["training"]["experiment_name"],
+        max_steps=raw["training"]["max_steps"],
+        episode_boundary_policy=EpisodeBoundaryPolicy[raw["data"]["episode_boundary_policy"]]
+        if "episode_boundary_policy" in raw["data"]
+        else None,
+    )
+
+
+def read_held_out(run_dir: Path | str) -> str | None:
+    """Digest of the validation episodes the run held out of training; None if none."""
+    path = record_path(run_dir)
+    raw = yaml.safe_load(path.read_text()) if path.is_file() else {}
+    if "held_out" not in raw:
+        raise ValueError(
+            f"{path} does not record which validation episodes were held out of training, "
+            "so resuming could validate on trained episodes. Use a fresh --output-dir."
+        )
+    return raw["held_out"]

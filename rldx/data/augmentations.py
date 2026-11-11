@@ -1,32 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# This file has been modified from the original NVIDIA Isaac GR00T N1.7.
+# Original source: https://github.com/NVIDIA/Isaac-GR00T
+
 """Image augmentation pipeline for RLDX.
 
 Pipeline (applied to every camera view):
 
   1. AspectAreaResizeAndCrop
        Aspect-ratio-preserving resize so the total pixel area is at most
-       ``image_max_area``, then center-crop both spatial dims down to
-       multiples of ``image_resize_m``.
+       ``image.max_area``, then center-crop both spatial dims down to
+       multiples of ``image.resize_m``.
        Deterministic — used by both train and eval.
 
   2. (optional) Fractional crop + resize-back
-       Crop a ``random_crop_fraction`` sub-region and resize it back to the
+       Crop an ``image.crop_fraction`` sub-region and resize it back to the
        post-step-1 shape, so downstream stages always see a fixed output size.
        - Training: random position (FractionalRandomCropAndResize).
-       - Inference: center position (FractionalCenterCropAndResize).
-       Skipped entirely when ``random_crop_fraction`` is None (no-op).
+       - Eval: center position, on the GPU with the patchify
+         (``rldx.planner.input.tensor_image.center_crop_and_resize``).
+       Skipped entirely when ``image.crop_fraction`` is None (no-op).
 
   3. (train only, optional) Rotate / ColorJitter
        Standard photometric & mild geometric augmentation.
 
-The builder :func:`build_image_transformations_albumentations` returns
-``(train_transform, eval_transform)``. The processor stores both and selects
-between them based on :pyattr:`ProcessorMixin.training` (PyTorch-style flag).
+The builder :func:`build_image_transformations_albumentations` returns the
+train transform. Eval runs step 1 alone through the processor's cv2 resize.
 """
 
 from __future__ import annotations
 
 import math
-import warnings
+from typing import TYPE_CHECKING
 
 import albumentations as A
 import cv2
@@ -34,8 +52,12 @@ import numpy as np
 import torch
 
 
+if TYPE_CHECKING:
+    from rldx.configs.model.rldx import ImageAugmentationConfig, ImageGeometryConfig
+
+
 # ---------------------------------------------------------------------------
-# Geometry helper (pure function — unit-tested for exact values)
+# Geometry helper (pure function)
 # ---------------------------------------------------------------------------
 
 
@@ -95,7 +117,7 @@ def apply_with_replay(transform, images, replay=None):
             first image creates fresh replay data.
 
     Returns:
-        ``(tensors, replay)`` — a list of ``uint8`` tensors ``(C, H, W)`` and
+        ``(tensors, replay)`` — a list of ``uint8`` tensors ``(H, W, C)`` and
         the replay blob (or None for plain ``A.Compose``).
     """
     transformed_tensors = []
@@ -103,19 +125,20 @@ def apply_with_replay(transform, images, replay=None):
     has_replay = hasattr(transform, "replay")
 
     for img in images:
+        img_arr = np.array(img)
+
         if has_replay:
             if current_replay is None:
-                augmented = transform(image=np.array(img))
+                augmented = transform(image=img_arr)
                 current_replay = augmented["replay"]
             else:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=UserWarning)
-                    augmented = transform.replay(
-                        image=np.array(img), saved_augmentations=current_replay
-                    )
+                augmented = transform.replay(
+                    image=img_arr,
+                    saved_augmentations=current_replay,
+                )
             img_array = augmented["image"]
         else:
-            augmented = transform(image=np.array(img))
+            augmented = transform(image=img_arr)
             img_array = augmented["image"]
 
         if img_array.dtype == np.float32:
@@ -123,8 +146,7 @@ def apply_with_replay(transform, images, replay=None):
         elif img_array.dtype != np.uint8:
             raise ValueError(f"Unexpected data type: {img_array.dtype}")
 
-        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1)
-        transformed_tensors.append(img_tensor)
+        transformed_tensors.append(torch.from_numpy(img_array))
 
     return transformed_tensors, current_replay
 
@@ -166,23 +188,35 @@ class AspectAreaResizeAndCrop(A.DualTransform):
         x_min, y_min, x_max, y_max = crop_coords
         return resized[y_min:y_max, x_min:x_max]
 
-    def get_params_dependent_on_data(self, params, data):
-        h, w = params["shape"][:2]
+    def apply_with_params(self, params, *, image=None, **kwargs):
+        if image is not None:
+            params = {**params, **self._geometry(*image.shape[:2])}
+        return super().apply_with_params(params, image=image, **kwargs)
+
+    def _geometry(self, h, w):
         (h_r, w_r), (h_c, w_c) = resize_preserve_aspect_area_then_crop(
             h, w, max_area=self.max_area, m=self.m
         )
-        shape_key = (h, w)
-        if shape_key not in AspectAreaResizeAndCrop._logged_shapes:
-            AspectAreaResizeAndCrop._logged_shapes.add(shape_key)
-            print(
-                f"[AspectAreaResizeAndCrop] ({h}, {w}) → resize ({h_r}, {w_r}) → crop ({h_c}, {w_c})"
-            )
         y_min = (h_r - h_c) // 2
         x_min = (w_r - w_c) // 2
         return {
             "resize_hw": (h_r, w_r),
             "crop_coords": (x_min, y_min, x_min + w_c, y_min + h_c),
         }
+
+    def get_params_dependent_on_data(self, params, data):
+        h, w = params["shape"][:2]
+        geometry = self._geometry(h, w)
+        h_r, w_r = geometry["resize_hw"]
+        x_min, y_min, x_max, y_max = geometry["crop_coords"]
+        h_c, w_c = y_max - y_min, x_max - x_min
+        shape_key = (h, w)
+        if shape_key not in AspectAreaResizeAndCrop._logged_shapes:
+            AspectAreaResizeAndCrop._logged_shapes.add(shape_key)
+            print(
+                f"[AspectAreaResizeAndCrop] ({h}, {w}) → resize ({h_r}, {w_r}) → crop ({h_c}, {w_c})"
+            )
+        return geometry
 
     def get_transform_init_args_names(self):
         return ("max_area", "m", "interpolation")
@@ -196,7 +230,7 @@ class AspectAreaResizeAndCrop(A.DualTransform):
 class _FractionalCropAndResizeBase(A.DualTransform):
     """Crop a fraction of the input then resize back to the pre-crop shape.
 
-    Concrete subclasses choose the crop origin (random vs center).
+    Subclasses choose the crop origin.
     Both the crop fraction and the output shape are parameterised so the
     downstream stages always see a consistent spatial size.
     """
@@ -229,6 +263,21 @@ class _FractionalCropAndResizeBase(A.DualTransform):
     def _origin(self, max_y: int, max_x: int) -> tuple[int, int]:
         raise NotImplementedError
 
+    def apply_with_params(self, params, *, image=None, **kwargs):
+        if image is not None and params.get("out_hw") != image.shape[:2]:
+            h, w = image.shape[:2]
+            ch = max(1, int(h * self.crop_fraction))
+            cw = max(1, int(w * self.crop_fraction))
+            max_y, max_x = h - ch, w - cw
+            y_ratio, x_ratio = params["origin_ratio"]
+            y_min, x_min = self._replay_origin(y_ratio, x_ratio, max_y, max_x)
+            params = {
+                **params,
+                "crop_coords": (x_min, y_min, x_min + cw, y_min + ch),
+                "out_hw": (h, w),
+            }
+        return super().apply_with_params(params, image=image, **kwargs)
+
     def get_params_dependent_on_data(self, params, data):
         h, w = params["shape"][:2]
         ch = max(1, int(h * self.crop_fraction))
@@ -237,7 +286,14 @@ class _FractionalCropAndResizeBase(A.DualTransform):
         return {
             "crop_coords": (x_min, y_min, x_min + cw, y_min + ch),
             "out_hw": (h, w),
+            "origin_ratio": (
+                y_min / (h - ch) if h > ch else 0.0,
+                x_min / (w - cw) if w > cw else 0.0,
+            ),
         }
+
+    def _replay_origin(self, y_ratio, x_ratio, max_y, max_x):
+        return round(y_ratio * max_y), round(x_ratio * max_x)
 
     def get_transform_init_args_names(self) -> tuple[str, ...]:
         return ("crop_fraction", "interpolation")
@@ -252,87 +308,49 @@ class FractionalRandomCropAndResize(_FractionalCropAndResizeBase):
         return y, x
 
 
-class FractionalCenterCropAndResize(_FractionalCropAndResizeBase):
-    """Center fractional crop, then resize back to the pre-crop (H, W)."""
-
-    def _origin(self, max_y: int, max_x: int) -> tuple[int, int]:
-        return max_y // 2, max_x // 2
-
-
 # ---------------------------------------------------------------------------
-# Builder — constructs both train and eval transforms for the processor
+# Builder — constructs the train transform for the processor
 # ---------------------------------------------------------------------------
 
 
 def build_image_transformations_albumentations(
-    image_max_area: int = 65536,
-    image_resize_m: int = 32,
-    random_crop_fraction: float | None = None,
-    random_rotation_angle: int | None = None,
-    color_jitter_params: dict | None = None,
-) -> tuple[A.BaseCompose, A.BaseCompose]:
-    """Build the ``(train_transform, eval_transform)`` pair.
+    image: ImageGeometryConfig, augmentation: ImageAugmentationConfig
+) -> A.ReplayCompose:
+    """Build the train transform: the aspect-area resize and crop of ``image``, then the
+    stochastic crop, rotation and color jitter.
 
-    The eval transform is deterministic. The train transform adds stochastic
-    augmentation (random-position fractional crop, rotate, color jitter) on
-    top of the same deterministic step-1 geometry. When
-    ``random_crop_fraction`` is None, step 2 is skipped entirely and the
-    pipeline is a pure aspect-area resize + m-aligned center crop.
-
-    Args:
-        image_max_area: Area budget for step 1 (default ``256*256 = 65536``).
-        image_resize_m: Alignment multiple for step 1 (default ``32``).
-        random_crop_fraction: Crop fraction for step 2. None = no-op (no
-            step-2 crop, transforms produce step-1 output directly).
-        random_rotation_angle: Optional ``A.Rotate(limit=...)`` (train only).
-        color_jitter_params: Optional ``A.ColorJitter`` params
-            ``{"brightness", "contrast", "saturation", "hue"}`` (train only).
-
-    Returns:
-        ``(train_transform, eval_transform)`` — both are albumentations
-        composes that take ``image=np.ndarray`` kwargs and return dicts.
+    Returns an albumentations ``ReplayCompose`` that takes ``image=np.ndarray``.
     """
-    train_list: list = [
+    train_list: list = []
+    train_list.append(
         AspectAreaResizeAndCrop(
-            max_area=image_max_area, m=image_resize_m, interpolation=cv2.INTER_AREA
+            max_area=image.max_area, m=image.resize_m, interpolation=cv2.INTER_AREA
         )
-    ]
-    eval_list: list = [
-        AspectAreaResizeAndCrop(
-            max_area=image_max_area, m=image_resize_m, interpolation=cv2.INTER_AREA
-        )
-    ]
+    )
 
-    if random_crop_fraction is not None:
-        if not 0.0 < random_crop_fraction <= 1.0:
+    if image.crop_fraction is not None:
+        if not 0.0 < image.crop_fraction <= 1.0:
             raise ValueError(
-                f"random_crop_fraction must be in (0.0, 1.0], got {random_crop_fraction!r}"
+                f"random_crop_fraction must be in (0.0, 1.0], got {image.crop_fraction!r}"
             )
         train_list.append(
             FractionalRandomCropAndResize(
-                crop_fraction=random_crop_fraction, interpolation=cv2.INTER_LINEAR
-            )
-        )
-        eval_list.append(
-            FractionalCenterCropAndResize(
-                crop_fraction=random_crop_fraction, interpolation=cv2.INTER_LINEAR
+                crop_fraction=image.crop_fraction, interpolation=cv2.INTER_LINEAR
             )
         )
 
-    if random_rotation_angle is not None and random_rotation_angle != 0:
-        train_list.append(A.Rotate(limit=random_rotation_angle, p=1.0))
+    if augmentation.rotation_angle is not None and augmentation.rotation_angle != 0:
+        train_list.append(A.Rotate(limit=augmentation.rotation_angle, p=1.0))
 
-    if color_jitter_params is not None:
+    if augmentation.color_jitter is not None:
         train_list.append(
             A.ColorJitter(
-                brightness=color_jitter_params.get("brightness", 0.0),
-                contrast=color_jitter_params.get("contrast", 0.0),
-                saturation=color_jitter_params.get("saturation", 0.0),
-                hue=color_jitter_params.get("hue", 0.0),
+                brightness=augmentation.color_jitter.get("brightness", 0.0),
+                contrast=augmentation.color_jitter.get("contrast", 0.0),
+                saturation=augmentation.color_jitter.get("saturation", 0.0),
+                hue=augmentation.color_jitter.get("hue", 0.0),
                 p=1.0,
             )
         )
 
-    train_transform = A.ReplayCompose(train_list, p=1.0)
-    eval_transform = A.Compose(eval_list)
-    return train_transform, eval_transform
+    return A.ReplayCompose(train_list, p=1.0)

@@ -1,0 +1,82 @@
+# gitleaks configuration for this repository.
+#
+# The default ruleset already covers vendor-prefixed credentials (hf_…, ghp_…,
+# and friends), which are recognisable from the value alone. The rules below
+# cover the shapes that have neither a prefix nor a fixed length: for those,
+# the surrounding variable name or command is the only thing that separates a
+# credential from an ordinary string, so each rule matches on that context.
+#
+# Markdown stays in scope on purpose. Setup and deployment instructions are a
+# common place for real values to get pasted, and scanning only code files
+# would leave that gap open.
+
+title = "RLDX secret scan"
+
+[extend]
+useDefault = true
+
+# The default generic-api-key rule keys off words like "token" and "key" near a
+# long value. In this codebase that fires on tokenizer identifiers — the import
+# line `from transformers import AutoTokenizer, <Model>ForCausalLM` reads as
+# "token" followed by a high-entropy symbol. Scoped to the match text so it
+# suppresses that shape only, not a whole file or path.
+[[allowlists]]
+description = "Tokenizer identifiers are not credentials"
+regexTarget = "match"
+regexes = [
+  '''(?i)(?:auto)?tokeniz(?:er|ers|ation|e)''',
+]
+
+# ── Weights & Biases API key ──────────────────────────────────────────────────
+# A bare 40-char hex string, indistinguishable from a commit SHA or a checksum
+# without context, so the variable name has to be part of the pattern.
+#
+# The value does not always sit on the same line as the name. In a Kubernetes
+# manifest it is two lines away:
+#
+#     - name: WANDB_API_KEY
+#       value: "<key>"
+#
+# so the gap allows newlines. `wandb login <key>` is covered by the same rule.
+[[rules]]
+id = "rlwrld-wandb-api-key"
+description = "Weights & Biases API key (unprefixed 40-hex, identified by context)"
+regex = '''(?i)(?:wandb[_-]?api[_-]?key|wandb\s+login)[\s\S]{0,80}?\b([0-9a-f]{40})\b'''
+keywords = ["wandb"]
+
+# ── Ubuntu Pro contract token ─────────────────────────────────────────────────
+# No prefix and no published pattern, so neither the default ruleset nor
+# GitHub's partner patterns recognise it. Matched by the variable name or by
+# the attach command that consumes it.
+[[rules]]
+id = "rlwrld-ubuntu-pro-token"
+description = "Ubuntu Pro contract token (no published pattern, identified by context)"
+regex = '''(?i)(?:ubuntu[_-]?pro[_-]?token|\b(?:pro|ua)\s+attach)[\s\S]{0,40}?["']?\b([A-Za-z0-9]{24,40})\b'''
+keywords = ["ubuntu_pro", "ubuntu-pro", "ubuntupro", "pro attach", "ua attach"]
+
+  [[rules.allowlists]]
+  regexTarget = "secret"
+  regexes = [
+    '''(?i)^(?:your|my|the)[_-]?.*$''',
+    '''(?i)^(?:changeme|example|placeholder|token|redacted|x{4,})$''',
+  ]
+
+# ── Plaintext password assignment ─────────────────────────────────────────────
+# GitHub push protection excludes passwords by design (they raise alerts but do
+# not block a push), so a password pasted into a setup document is only caught
+# here. Restricted to quoted literals — variable and environment lookups such as
+# `os.environ["…"]` or `args.password` have no opening quote after the operator
+# and so never match.
+[[rules]]
+id = "rlwrld-plaintext-password"
+description = "Plaintext password literal (sudo_password / password / passwd)"
+regex = '''(?i)\b(?:sudo[_-]?password|sudo[_-]?pass|passwd|password)\b\s*[:=]\s*["']([^"'\s$<>{}\[\]][^"'\n]{5,})["']'''
+keywords = ["password", "passwd"]
+
+  [[rules.allowlists]]
+  regexTarget = "secret"
+  regexes = [
+    '''(?i)^(?:your|my|the|a)[_-]?.*$''',
+    '''(?i)^(?:changeme|change[_-]?me|example|placeholder|password|secret|redacted|dummy|fake|test|none|null|x{4,})$''',
+    '''^\$\{?[A-Za-z_].*$''',
+  ]

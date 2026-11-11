@@ -1,6 +1,6 @@
 # Architecture
 
-High-level walkthrough of the RLDX-1 model. This is the "what is in the
+High-level walkthrough of the RLDX-1.1 model. This is the "what is in the
 box" view; configuration knobs are cross-linked to source and to
 [`training.md`](training.md) for hands-on use.
 
@@ -40,7 +40,7 @@ box" view; configuration knobs are cross-linked to source and to
 
 ## The model at a glance
 
-- **Total size:** 6.9B params (base) / 8.0B params (with memory + motion +
+- **Total size:** 6.6B params (base) / 7.8B params (with memory + motion +
   physics add-ons), bf16.
 - **Input:** one or more camera views (each a short clip of PIL frames),
   a low-dimensional proprioceptive state vector, an optional physics
@@ -55,30 +55,33 @@ box" view; configuration knobs are cross-linked to source and to
 ## Stage 1 — image pipeline
 
 Code: [`rldx/data/augmentations.py`](../rldx/data/augmentations.py)
-Config: `image_max_area`, `image_resize_m`, `random_crop_fraction`,
-`random_rotation_angle`, `color_jitter_params` on `RLDXConfig`.
+Config: `RLDXConfig.image` (`ImageGeometryConfig`: `max_area`, `resize_m`,
+`crop_fraction`) and `RLDXConfig.augmentation` (`ImageAugmentationConfig`:
+`rotation_angle`, `color_jitter`).
 
 Every camera frame goes through the same two-stage pipeline:
 
 1. **AspectAreaResizeAndCrop** (deterministic). Downscales so the total
-   area is ≤ `image_max_area`, keeping aspect ratio, then center-crops
-   both dims to multiples of `image_resize_m`. The default `(max_area=65536,
+   area is ≤ `image.max_area`, keeping aspect ratio, then center-crops
+   both dims to multiples of `image.resize_m`. The default `(max_area=65536,
    m=32)` maps `(480, 640) → (192, 256)` and leaves `(256, 256)`
    untouched.
 2. **Fractional crop + resize-back** (optional). When
-   `random_crop_fraction` is set, a `fraction * H × fraction * W`
+   `image.crop_fraction` is set, a `fraction * H × fraction * W`
    sub-region is cropped (**random** position during training,
    **center** at eval time) and then resized back to the pre-crop shape
    so downstream stages always see a fixed spatial size. The stage is
    skipped entirely when the fraction is `None` (the default).
 3. **Train-only photometric / geometric augmentation.** Rotate
-   (`random_rotation_angle`) and ColorJitter (`color_jitter_params`)
+   (`augmentation.rotation_angle`) and ColorJitter (`augmentation.color_jitter`)
    are added to the train transform only.
 
-The train and eval transforms are built once at processor construction
-and selected based on `ProcessorMixin.training` at call time
-(`processor.train()` / `processor.eval()`). A replay mechanism keeps
-all camera views in a batch on the same random parameters.
+Training runs all three stages on the host as one albumentations
+transform; a replay mechanism keeps all camera views in a batch on the
+same random parameters. Eval (`processor.eval()`) runs stage 1 on the
+host with cv2. Every path then ships uint8 frames to the GPU, where
+`rldx/runtime/tensor_image.py` patchifies them, applying the eval center
+crop first.
 
 ## Stage 2 — backbone
 
@@ -93,10 +96,11 @@ The supported backbone is a Qwen3-VL derivative:
 The [`VTCQwen3VLBackbone`](../rldx/model/modules/backbone/adapter.py)
 adapter exposes:
 
-- `encode(vlm_inputs, prompt_embeds, ...)` → `(vlm_hidden, cognition_tokens)`
-- `embed_tokens(...)` → injects the learnable cognition-token embedding
-  before the transformer stack, so the backbone produces dedicated token
-  positions the action model can read from.
+- `forward(vl_input)` → `backbone_features`, `backbone_attention_mask`,
+  `image_mask`
+- it injects the learnable cognition-token embedding before the
+  transformer stack, so the backbone produces dedicated token positions
+  the action model can read from.
 
 Relevant `RLDXConfig` fields:
   - `model_name`, `model_revision` — backbone weights to load
@@ -120,19 +124,19 @@ directly) those cognition tokens.
 
 Two downstream modes for cognition tokens:
 
-- **Single-step** (`use_memory=False`, default). Each forward pass runs
+- **Single-step** (`config.memory is None`, default). Each forward pass runs
   one backbone call; the action model uses the cognition tokens from
   that single pass.
-- **History-aware** (`use_memory=True`). Past timesteps' cognition
+- **History-aware** (`config.memory` set). Past timesteps' cognition
   tokens are cached and fused via a Transformer memory module
   ([`rldx/model/modules/memory.py`](../rldx/model/modules/memory.py))
-  before reaching the action model. Controls: `memory_length`,
-  `memory_n_cog_tokens`, `concat_memory`, `memory_dropout_prob`.
+  before reaching the action model. Controls (`MemoryConfig`): `length`,
+  `n_cog_tokens`, `concat`, `dropout_prob`, `stride`.
 
 ## Stage 4 — MSAT action model
 
 Code: [`rldx/model/modules/action_model/`](../rldx/model/modules/action_model/)
-(`msat.py` `blocks.py` `attention.py` `ops.py`)
+(`msat.py` `blocks.py` `ops.py`)
 
 The action model is a Multi-Stream Action Transformer (MSAT) trained
 with **flow matching**: given a noised action chunk, the model predicts
@@ -140,16 +144,16 @@ the velocity field that transports it back to the clean chunk. At
 inference time we integrate that field through
 `num_inference_timesteps = 4` Euler steps (tunable).
 
-Three token streams flow through every MSAT block:
+Two token streams flow through every MSAT block, three when physics is on:
 - **VL stream** — projected cognition tokens + optional raw VLM hidden
   states
 - **SA (state/action) stream** — noised action chunk + state tokens
-- **P stream** — present when `use_physics=True`: projected physics
+- **P stream** — present when `config.physics` is set: projected physics
   tokens (tactile / torque / both)
 
 Block variants:
 - `DoubleStreamBlock` — VL + SA only (default)
-- `TripleStreamBlock` — VL + SA + P, used when physics is on
+- `ExpandedDoubleStreamBlock` — VL + SA + P, used when physics is on
 - `SingleStreamBlock` / `ExpandedSingleStreamBlock` — late layers after
   the cross-stream mixing
 
@@ -163,7 +167,7 @@ the CLI or from a YAML config):
 
 | Key | Default | What |
 |---|---|---|
-| `depth_multi_stream` | 4 | `DoubleStreamBlock` / `TripleStreamBlock` count |
+| `depth_multi_stream` | 4 | `DoubleStreamBlock` / `ExpandedDoubleStreamBlock` count |
 | `depth_single_stream` | 8 | `SingleStreamBlock` count |
 | `num_attention_heads` | 24 | MSAT attention heads |
 | `attention_head_dim` | 64 | per-head dim |
@@ -180,11 +184,11 @@ A pair of category-specific MLPs bridge embodiment-specific action
 spaces and the shared MSAT hidden space:
 
 - `MultiEmbodimentActionEncoder`: `(B, action_horizon, max_action_dim)` →
-  `(B, action_horizon, input_embedding_dim)`. One linear head per
-  embodiment index.
+  `(B, action_horizon, input_embedding_dim)`. Three category-specific
+  linear layers, one weight set per embodiment index.
 - `CategorySpecificMLP` decoder: MSAT output →
-  `(B, action_horizon, max_action_dim)`. One linear head per embodiment
-  index.
+  `(B, action_horizon, max_action_dim)`. A two-layer MLP, one weight set
+  per embodiment index.
 
 The state encoder is the same pattern: a `CategorySpecificMLP` maps
 `max_state_dim` raw proprioception into `hidden_size`. State is padded
@@ -193,13 +197,13 @@ the per-embodiment head selects the live slice.
 
 ## Optional modules
 
-- **Memory** (`use_memory=True`): multi-timestep cognition-token
+- **Memory** (`memory:on`; `config.memory is not None`): multi-timestep cognition-token
   aggregation via `rldx/model/modules/memory.py`.
-- **Motion module** (`use_motion=True`): motion-aware vision feature
+- **Motion module** (`motion:on`; `config.motion is not None`): motion-aware vision feature
   extractor injected into the Qwen3-VL encoder. Aimed at fine-grained
   temporal dynamics. Source:
-  `rldx/model/modules/vtc/motion.py`.
-- **Physics** (`use_physics=True`, `physics_keys=[...]`, `physics_dims=[...]`):
+  `rldx/model/modules/backbone/motion.py`.
+- **Physics** (`physics:on --physics.keys … --physics.dims …`; `config.physics is not None`):
   tactile / torque stream joined as a third MSAT stream. Flow matching
   supervises both action and future physics signals.
 
@@ -209,9 +213,9 @@ the per-embodiment head selects the live slice.
   - `processor.train()` selects the randomised image transform.
   - `RLDX.forward` samples a flow-matching timestep, noises the ground-
     truth action chunk, and computes the velocity-MSE loss.
-  - Distributed via DeepSpeed ZeRO-2 (default) or ZeRO-3.
+  - Distributed via DeepSpeed ZeRO-2.
 - **Inference**:
-  - `processor.eval()` selects the deterministic transform.
+  - `processor.eval()` selects the deterministic resize.
   - `RLDX.get_action` integrates the learned velocity field for
     `num_inference_timesteps` Euler steps, starting from Gaussian noise,
     and returns the decoded `action_horizon`-step chunk.

@@ -1,11 +1,10 @@
 # Finetune datasets
-/examples/GR00T-WholeBodyControl/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim/
 /examples/LIBERO/libero_10_no_noops_1.0.0_lerobot/
 /examples/LIBERO/libero_goal_no_noops_1.0.0_lerobot/
 /examples/LIBERO/libero_object_no_noops_1.0.0_lerobot/
 /examples/LIBERO/libero_spatial_no_noops_1.0.0_lerobot/
 
-# UV lock file is now committed (Issue #21) so `uv sync` is reproducible.
+# UV lock file is now committed so `uv sync` is reproducible.
 # Do NOT add `uv.lock` back here without replacing it with a CI-enforced
 # `uv lock --check` step.
 
@@ -170,7 +169,6 @@ dump.rdb
 # SysID / robotics experiment data
 sysid_data/
 isaac_data/
-offline_open_loop_eval_plots/
 
 # Generic model/data folders
 /models
@@ -201,3 +199,4 @@ docs/claude/
 # User-local artifacts not committed to shared branches
 output_final/
 run_scripts/eval/libero/local_eval_rldx_libero.sh
+run_scripts/train/RLDX1-pt-cm-*.sh

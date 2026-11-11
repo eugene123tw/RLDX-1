@@ -31,22 +31,72 @@ import logging
 
 import numpy as np
 from rldx.configs.data.embodiment_configs import (
+    ActionConfig,
     ActionFormat,
     ActionRepresentation,
     ActionType,
     ModalityConfig,
 )
 from rldx.data.state_action.action_chunking import EndEffectorActionChunk, JointActionChunk
+from rldx.data.state_action.action_codec import ActionKeyCodec
+from rldx.data.state_action.layout import Layout, join, split
+from rldx.data.state_action.norm_stats import NormStats
 from rldx.data.state_action.pose import EndEffectorPose, JointPose
 from rldx.data.utils import (
     apply_sin_cos_encoding,
-    nested_dict_to_numpy,
     normalize_values_meanstd,
     normalize_values_minmax,
     parse_modality_configs,
-    unnormalize_values_meanstd,
-    unnormalize_values_minmax,
 )
+
+
+def _group(values: dict[str, np.ndarray], key: str, embodiment_tag: str) -> np.ndarray:
+    if key not in values:
+        raise KeyError(
+            f"Joint group '{key}' not found in action dict for embodiment '{embodiment_tag}'"
+        )
+    return values[key]
+
+
+def _same_stats(a: dict[str, list[float]], b: dict[str, list[float]]) -> bool:
+    if a.keys() != b.keys():
+        return False
+    for stat in a:
+        x, y = np.asarray(a[stat], dtype=np.float64), np.asarray(b[stat], dtype=np.float64)
+        if x.shape != y.shape or not np.allclose(x, y):
+            return False
+    return True
+
+
+def _check_kept_statistics(embodiment_tag: str, kept: dict, incoming: dict) -> None:
+    """Fail or warn when ``incoming`` statistics are dropped in favour of ``kept`` ones."""
+    flag = "--override-pretraining-statistics"
+    # Physics groups missing from the base are left out: apply_physics passes them raw (midtrain).
+    missing = {
+        modality: sorted(set(incoming[modality]) - set(kept.get(modality, {})))
+        for modality in ("state", "action")
+        if modality in incoming
+    }
+    missing = {modality: keys for modality, keys in missing.items() if keys}
+    if missing:
+        raise ValueError(
+            f"The base checkpoint already has statistics for embodiment tag '{embodiment_tag}', "
+            f"so this run's dataset statistics are not used, but they have joint groups the "
+            f"checkpoint's do not: {missing}. Normalizing would fail on the first batch. "
+            f"Pass {flag} to normalize with this run's statistics."
+        )
+    differing = sorted(
+        f"{modality}/{group}"
+        for modality, groups in incoming.items()
+        for group, stats in groups.items()
+        if group in kept.get(modality, {}) and not _same_stats(kept[modality][group], stats)
+    )
+    if differing:
+        logging.warning(
+            f"[StateActionProcessor] Embodiment tag '{embodiment_tag}' keeps the base checkpoint's "
+            f"statistics, which differ from this run's dataset statistics for {differing}. "
+            f"Pass {flag} to normalize with this run's statistics."
+        )
 
 
 class StateActionProcessor:
@@ -82,7 +132,7 @@ class StateActionProcessor:
                 where modality in ["state", "action", "relative_action"]
                 and stat_type in ["min", "max", "mean", "std", "q01", "q99"]
                 Example: {"gr1": {"state": {"left_arm": {"min": [...], "max": [...], ...}}}}
-            use_percentiles: Whether to use percentiles (q01/q99) instead of min/max
+            use_percentiles: True normalizes to q01/q99, False to min/max
             clip_outliers: Whether to clip normalized values to [-1, 1]
             apply_sincos_state_encoding: Global flag to enable sin/cos encoding for states
         """
@@ -94,9 +144,7 @@ class StateActionProcessor:
         self.use_relative_action = use_relative_action
 
         # Normalization parameters computed from statistics
-        self.norm_params: dict[str, dict[str, dict[str, dict[str, np.ndarray]]]] = {}
-        # Format: norm_params[embodiment_tag][modality][joint_group][stat_type]
-        # where stat_type in ["min", "max", "mean", "std", "dim"]
+        self.norm_params: dict[str, dict[str, dict[str, NormStats]]] = {}
 
         if statistics is not None:
             self.set_statistics(statistics)
@@ -125,7 +173,7 @@ class StateActionProcessor:
             if key not in self.statistics or override:
                 self.statistics[key] = deepcopy(statistics[key])
             else:
-                print(f"Embodiment tag {key} already in statistics, skipping updating")
+                _check_kept_statistics(key, self.statistics[key], statistics[key])
         self._compute_normalization_parameters()
 
     def _compute_normalization_parameters(self) -> None:
@@ -140,48 +188,26 @@ class StateActionProcessor:
                 self.norm_params[embodiment_tag][modality] = {}
 
                 for joint_group, stats in self.statistics[embodiment_tag][modality].items():
-                    if self.use_percentiles:
-                        min_vals = np.array(stats["q01"])
-                        max_vals = np.array(stats["q99"])
-                    else:
-                        min_vals = np.array(stats["min"])
-                        max_vals = np.array(stats["max"])
+                    low, high = ("q01", "q99") if self.use_percentiles else ("min", "max")
+                    self.norm_params[embodiment_tag][modality][joint_group] = NormStats.from_stats(
+                        stats, low, high
+                    )
 
-                    mean_vals = np.array(stats["mean"])
-                    std_vals = np.array(stats["std"])
-
-                    # Compute range, ensuring it's not zero
-                    range_vals = max_vals - min_vals
-                    range_vals = np.maximum(range_vals, 1e-8)
-
-                    self.norm_params[embodiment_tag][modality][joint_group] = {
-                        "min": min_vals,
-                        "max": max_vals,
-                        "dim": np.array(range_vals.shape[0]),
-                        "mean": mean_vals,
-                        "std": std_vals,
-                    }
-
-            # Physics modalities (tactile, torque, etc.): store q01/q99 for normalize_values_q99
+            # Physics modalities (tactile, torque, etc.): q01/q99 for normalize_values_q99
             for modality, stats_per_group in self.statistics[embodiment_tag].items():
                 if modality in ("state", "action", "relative_action"):
                     continue  # Already handled above
                 self.norm_params[embodiment_tag][modality] = {}
                 for joint_group, stats in stats_per_group.items():
-                    self.norm_params[embodiment_tag][modality][joint_group] = {
-                        "q01": np.array(stats["q01"]),
-                        "q99": np.array(stats["q99"]),
-                        "min": np.array(stats["min"]),
-                        "max": np.array(stats["max"]),
-                        "mean": np.array(stats["mean"]),
-                        "std": np.array(stats["std"]),
-                        "dim": np.array(len(stats["mean"])),
-                    }
+                    self.norm_params[embodiment_tag][modality][joint_group] = NormStats.from_stats(
+                        stats, "q01", "q99"
+                    )
 
             # Override absolute action stats with relative stats where specified
-            if "action" in self.modality_configs[embodiment_tag]:
-                modality_keys = self.modality_configs[embodiment_tag]["action"].modality_keys
-                action_configs = self.modality_configs[embodiment_tag]["action"].action_configs
+            embodiment_modality_configs = self.modality_configs.get(embodiment_tag, {})
+            if "action" in embodiment_modality_configs:
+                modality_keys = embodiment_modality_configs["action"].modality_keys
+                action_configs = embodiment_modality_configs["action"].action_configs
 
                 if action_configs is not None:
                     for key, action_config in zip(modality_keys, action_configs):
@@ -199,11 +225,14 @@ class StateActionProcessor:
                                     f"Relative action statistics required for key '{key}' "
                                     f"in embodiment '{embodiment_tag}' but not found"
                                 )
-                            action_dim = self.norm_params[embodiment_tag]["action"][key]["dim"]
-                            self.norm_params[embodiment_tag]["action"][key] = nested_dict_to_numpy(
-                                self.statistics[embodiment_tag]["relative_action"][key]
+                            # TODO: raw min/max whatever use_percentiles, as in GR00T N1.6.
+                            # Following the mode changes relative-trained checkpoints' numerics.
+                            self.norm_params[embodiment_tag]["action"][key] = NormStats.from_stats(
+                                self.statistics[embodiment_tag]["relative_action"][key],
+                                "min",
+                                "max",
+                                dim=self.norm_params[embodiment_tag]["action"][key].dim,
                             )
-                            self.norm_params[embodiment_tag]["action"][key]["dim"] = action_dim
 
     def apply_state(
         self,
@@ -230,7 +259,7 @@ class StateActionProcessor:
         sin_cos_keys = None
         if self.apply_sincos_state_encoding:
             state_config = self.modality_configs[embodiment_tag].get("state")
-            if state_config and hasattr(state_config, "sin_cos_embedding_keys"):
+            if state_config:
                 sin_cos_keys = state_config.sin_cos_embedding_keys
 
         for joint_group in self.modality_configs[embodiment_tag]["state"].modality_keys:
@@ -245,8 +274,7 @@ class StateActionProcessor:
 
             # Strategy 2: Mean/std normalization
             elif (
-                hasattr(self.modality_configs[embodiment_tag]["state"], "mean_std_embedding_keys")
-                and self.modality_configs[embodiment_tag]["state"].mean_std_embedding_keys
+                self.modality_configs[embodiment_tag]["state"].mean_std_embedding_keys
                 and joint_group
                 in self.modality_configs[embodiment_tag]["state"].mean_std_embedding_keys
             ):
@@ -266,260 +294,72 @@ class StateActionProcessor:
 
         return normalized_values
 
-    def unapply_state(
-        self,
-        state: dict[str, np.ndarray],
-        embodiment_tag: str,
-    ) -> dict[str, np.ndarray]:
-        """
-        Reverse state processing (denormalization).
+    def action_codecs(self, embodiment_tag: str) -> dict[str, ActionKeyCodec]:
+        config = self.modality_configs[embodiment_tag]["action"]
+        mean_std = set(config.mean_std_embedding_keys or ())
+        action_configs = config.action_configs or [None] * len(config.modality_keys)
+        return {
+            key: ActionKeyCodec(
+                key=key,
+                embodiment_tag=embodiment_tag,
+                params=self.norm_params[embodiment_tag]["action"][key],
+                mean_std=key in mean_std,
+                clip=self.clip_outliers,
+                relative=action_config if self._codes_relative(action_config) else None,
+                to_relative=self._convert_to_relative_action,
+                to_absolute=self._convert_to_absolute_action,
+            )
+            for key, action_config in zip(config.modality_keys, action_configs)
+        }
 
-        Args:
-            state: Dict mapping joint_group -> processed state values
-            embodiment_tag: Embodiment identifier
-
-        Returns:
-            Dict mapping joint_group -> raw state values
-
-        Raises:
-            ValueError: If attempting to reverse sin/cos encoding (not reversible)
-        """
-        unnormalized_values = {}
-
-        # Get sin/cos embedding keys if enabled
-        sin_cos_keys = None
-        if self.apply_sincos_state_encoding:
-            state_config = self.modality_configs[embodiment_tag].get("state")
-            if state_config and hasattr(state_config, "sin_cos_embedding_keys"):
-                sin_cos_keys = state_config.sin_cos_embedding_keys
-
-        for joint_group in self.modality_configs[embodiment_tag]["state"].modality_keys:
-            if joint_group not in state:
-                raise KeyError(
-                    f"Joint group '{joint_group}' not found in state dict for embodiment '{embodiment_tag}'"
-                )
-
-            # Sin/cos encoding is not reversible
-            if sin_cos_keys and joint_group in sin_cos_keys:
-                raise ValueError(
-                    f"Cannot unapply sin/cos encoding for joint group '{joint_group}' "
-                    f"in embodiment '{embodiment_tag}'. This transformation is not reversible."
-                )
-
-            # Reverse mean/std normalization
-            elif (
-                hasattr(self.modality_configs[embodiment_tag]["state"], "mean_std_embedding_keys")
-                and self.modality_configs[embodiment_tag]["state"].mean_std_embedding_keys
-                and joint_group
-                in self.modality_configs[embodiment_tag]["state"].mean_std_embedding_keys
-            ):
-                params = self.norm_params[embodiment_tag]["state"][joint_group]
-                unnormalized = unnormalize_values_meanstd(state[joint_group], params)
-                unnormalized_values[joint_group] = unnormalized
-
-            # Reverse min/max normalization
-            else:
-                params = self.norm_params[embodiment_tag]["state"][joint_group]
-                unnormalized_values[joint_group] = unnormalize_values_minmax(
-                    state[joint_group], params
-                )
-
-        return unnormalized_values
+    def _codes_relative(self, action_config: ActionConfig | None) -> bool:
+        return (
+            self.use_relative_action
+            and action_config is not None
+            and action_config.rep == ActionRepresentation.RELATIVE
+        )
 
     def apply_action(
         self,
         action: dict[str, np.ndarray],
         embodiment_tag: str,
         state: dict[str, np.ndarray] | None = None,
+        position_slice: slice | None = None,
     ) -> dict[str, np.ndarray]:
-        """
-        Apply action processing (absolute->relative conversion, normalization).
-
-        Processing order:
-        1. Convert absolute actions to relative (if configured)
-        2. Normalize actions
-
-        Args:
-            action: Dict mapping joint_group -> raw action values
-                Shape per group: (T, D) where T is action horizon, D is action dimension
-            embodiment_tag: Embodiment identifier
-            state: Optional dict mapping joint_group -> raw state values
-                Required if any action group uses ActionRepresentation.RELATIVE
-                Shape per group: (T_state, D) where last timestep is used as reference
-
-        Returns:
-            Dict mapping joint_group -> processed action values
-                Shape per group: (T, D)
-
-        Raises:
-            ValueError: If state is None but required for relative action conversion
-        """
-        action = deepcopy(action)  # Avoid modifying input
-
-        # Step 1: Convert absolute actions to relative (if needed)
-        modality_keys = self.modality_configs[embodiment_tag]["action"].modality_keys
-        action_configs = self.modality_configs[embodiment_tag]["action"].action_configs
-
-        if action_configs is not None:
-            for key, action_config in zip(modality_keys, action_configs):
-                if action_config.rep == ActionRepresentation.RELATIVE and self.use_relative_action:
-                    if state is None:
-                        raise ValueError(
-                            f"State dict required for relative action processing of key '{key}' "
-                            f"in embodiment '{embodiment_tag}'"
-                        )
-
-                    # Determine which state key to use as reference
-                    state_key = action_config.state_key if action_config.state_key else key
-
-                    if state_key not in state:
-                        raise KeyError(
-                            f"Reference state key '{state_key}' not found in state dict "
-                            f"for embodiment '{embodiment_tag}'"
-                        )
-
-                    # Use last state as reference frame
-                    reference_state = state[state_key][-1]
-
-                    # Convert absolute to relative
-                    action[key] = self._convert_to_relative_action(
-                        action=action[key],
-                        reference_state=reference_state,
-                        action_type=action_config.type,
-                        action_format=action_config.format,
-                    )
-
-        # Step 2: Normalize actions
-        normalized_values = {}
-        for joint_group in modality_keys:
-            if joint_group not in action:
-                raise KeyError(
-                    f"Joint group '{joint_group}' not found in action dict for embodiment '{embodiment_tag}'"
-                )
-
-            params = self.norm_params[embodiment_tag]["action"][joint_group]
-            if (
-                self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys is not None
-                and joint_group
-                in self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys
-            ):
-                normalized = normalize_values_meanstd(action[joint_group], params)
-            else:
-                normalized = normalize_values_minmax(action[joint_group], params)
-
-            if self.clip_outliers:
-                normalized = np.clip(normalized, -1.0, 1.0)
-
-            normalized_values[joint_group] = normalized
-
-        return normalized_values
+        return {
+            key: codec.encode(_group(action, key, embodiment_tag), state, position_slice)
+            for key, codec in self.action_codecs(embodiment_tag).items()
+        }
 
     def unapply_action(
         self,
         action: dict[str, np.ndarray],
         embodiment_tag: str,
         state: dict[str, np.ndarray] | None = None,
+        position_slice: slice | None = None,
     ) -> dict[str, np.ndarray]:
-        """
-        Reverse action processing (denormalization, relative->absolute conversion).
+        return {
+            key: codec.decode(_group(action, key, embodiment_tag), state, position_slice)
+            for key, codec in self.action_codecs(embodiment_tag).items()
+        }
 
-        Processing order:
-        1. Denormalize actions
-        2. Convert relative actions to absolute (if configured)
-
-        Args:
-            action: Dict mapping joint_group -> processed action values
-                Shape per group: (T, D) or (B, T, D) for batched
-            embodiment_tag: Embodiment identifier
-            state: Optional dict mapping joint_group -> raw state values
-                Required if any action group uses ActionRepresentation.RELATIVE
-                Shape per group: (T_state, D) or (B, T_state, D) for batched
-
-        Returns:
-            Dict mapping joint_group -> raw absolute action values
-                Shape per group: (T, D) or (B, T, D) for batched
-
-        Raises:
-            ValueError: If state is None but required for relative->absolute conversion
-        """
-        # Step 1: Unnormalize actions
-        unnormalized_values = {}
-        modality_keys = self.modality_configs[embodiment_tag]["action"].modality_keys
-
-        for joint_group in modality_keys:
-            if joint_group not in action:
-                raise KeyError(
-                    f"Joint group '{joint_group}' not found in action dict for embodiment '{embodiment_tag}'"
-                )
-
-            params = self.norm_params[embodiment_tag]["action"][joint_group]
-            group_values = action[joint_group]
-
-            if (
-                self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys is not None
-                and joint_group
-                in self.modality_configs[embodiment_tag]["action"].mean_std_embedding_keys
-            ):
-                unnormalized = unnormalize_values_meanstd(group_values, params)
-            else:
-                unnormalized = unnormalize_values_minmax(group_values, params)
-
-            unnormalized_values[joint_group] = unnormalized
-
-        # Step 2: Convert relative actions to absolute (if needed)
-        action_configs = self.modality_configs[embodiment_tag]["action"].action_configs
-
-        if action_configs is not None:
-            for key, action_config in zip(modality_keys, action_configs):
-                if action_config.rep == ActionRepresentation.RELATIVE and self.use_relative_action:
-                    if state is None:
-                        raise ValueError(
-                            f"State dict required for relative->absolute conversion of key '{key}' "
-                            f"in embodiment '{embodiment_tag}'"
-                        )
-
-                    # Determine which state key to use as reference
-                    state_key = action_config.state_key if action_config.state_key else key
-
-                    if state_key not in state:
-                        raise KeyError(
-                            f"Reference state key '{state_key}' not found in state dict "
-                            f"for embodiment '{embodiment_tag}'"
-                        )
-
-                    relative_action = unnormalized_values[key]
-
-                    # Handle batched and unbatched cases
-                    is_batched = relative_action.ndim == 3
-                    if not is_batched:
-                        assert relative_action.ndim == 2
-                        reference_state = state[state_key]
-                        if reference_state.ndim == 2:
-                            reference_state = reference_state[None, :]
-                        relative_action = relative_action[None, :]
-                    else:
-                        reference_state = state[state_key]
-                        if reference_state.ndim == 2:
-                            reference_state = reference_state[None, :]
-
-                    # Convert batched relative actions to absolute
-                    absolute_actions = []
-                    for s, a in zip(reference_state, relative_action):
-                        # Use last timestep of state as reference
-                        absolute_action = self._convert_to_absolute_action(
-                            action=a,
-                            reference_state=s[-1],
-                            action_type=action_config.type,
-                            action_format=action_config.format,
-                        )
-                        absolute_actions.append(absolute_action)
-
-                    if is_batched:
-                        unnormalized_values[key] = np.stack(absolute_actions, axis=0)
-                    else:
-                        unnormalized_values[key] = absolute_actions[0]
-
-        return unnormalized_values
+    def reframe_action(
+        self,
+        action: np.ndarray,
+        embodiment_tag: str,
+        prev_state: dict[str, np.ndarray],
+        new_state: dict[str, np.ndarray],
+        prev_position: slice,
+        new_position: slice,
+    ) -> np.ndarray:
+        layout = self.layout(embodiment_tag, "action")
+        parts = split(action, layout)
+        moved = {
+            key: codec.reframe(parts[key], prev_state, new_state, prev_position, new_position)
+            for key, codec in self.action_codecs(embodiment_tag).items()
+        }
+        padding = action[..., sum(layout.values()) :]
+        return np.concatenate([join(moved, layout), padding], axis=-1)
 
     def _has_params(self, embodiment_tag: str, modality: str, key: str) -> bool:
         return (
@@ -541,10 +381,11 @@ class StateActionProcessor:
 
         Returns:
             Dict of normalized values. Always a dict (possibly empty) — never
-            None. All-zero tactile/torque modalities are skipped (absent sensor
-            data), which may produce a smaller dict than the input. Callers
-            must detect missing modalities explicitly rather than relying on
-            a None sentinel.
+            None. In training, all-zero tactile/torque modalities are skipped
+            (zero-padded columns of sensor-less robots in mixed datasets),
+            which may produce a smaller dict than the input. Callers must
+            detect missing modalities explicitly rather than relying on a
+            None sentinel.
         """
         result = {}
         for compound_key, values in physics.items():
@@ -557,11 +398,13 @@ class StateActionProcessor:
                 modality, key = compound_key, compound_key
 
             if self._has_params(embodiment_tag, modality, key):
-                # All-zero tactile/torque signals the sensor was absent for this
-                # sample — skip only this modality. The previous `return None`
-                # discarded the entire `result` mid-loop, which silently
-                # dropped valid sibling modalities already normalized above.
-                if modality in ("torque", "tactile") and np.all(values == 0):
+                # Absent-sensor heuristic is TRAINING-only: mixed datasets
+                # carry zero-padded physics columns for robots without the
+                # sensor and cannot omit them (fixed schema). At inference
+                # absence is structural — a client without the sensor omits
+                # the group (allow_missing_physics) — so values that arrive are real
+                # readings: zero means no contact, not no sensor.
+                if self.training and modality in ("torque", "tactile") and np.all(values == 0):
                     continue
                 from rldx.data.utils import normalize_values_q99
 
@@ -570,12 +413,26 @@ class StateActionProcessor:
                 if self.clip_outliers:
                     normalized = np.clip(normalized, -1.0, 1.0)
                 result[compound_key] = normalized
-            else:
-                logging.debug(
-                    f"[StateActionProcessor] No stats for {modality}/{key} in "
-                    f"'{embodiment_tag}', skipping normalization"
+            elif self.training:
+                # Documented midtrain flow: adding physics on top of a base
+                # checkpoint whose statistics.json already covers the
+                # embodiment tag — set_statistics skips the tag wholesale, so
+                # the dataset's physics stats never merge and raw values are
+                # what this flow has always trained on. Keep it, loudly.
+                logging.warning(
+                    f"[StateActionProcessor] No stats for physics "
+                    f"'{modality}/{key}' in '{embodiment_tag}' — passing raw "
+                    "values through (training path)"
                 )
                 result[compound_key] = values
+            else:
+                raise ValueError(
+                    f"No normalization stats for physics '{modality}/{key}' in "
+                    f"embodiment '{embodiment_tag}'. Passing raw values through "
+                    "would silently feed the model out-of-distribution inputs — "
+                    "the checkpoint's stats and the requested physics keys "
+                    "disagree."
+                )
         return result
 
     def apply(
@@ -606,88 +463,13 @@ class StateActionProcessor:
             processed_action = {}
         return processed_state, processed_action
 
-    def unapply(
-        self,
-        state: dict[str, np.ndarray],
-        action: dict[str, np.ndarray],
-        embodiment_tag: str,
-        raw_state: dict[str, np.ndarray] | None = None,
-    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-        """
-        Reverse both state and action processing together.
-
-        Args:
-            state: Dict mapping joint_group -> processed state values
-            action: Dict mapping joint_group -> processed action values
-            embodiment_tag: Embodiment identifier
-            raw_state: Optional dict of raw states for relative->absolute conversion
-                If None, will use unapplied state (but won't work for sin/cos encoded states)
-
-        Returns:
-            Tuple of (raw_state, raw_action)
-        """
-        # Unapply state first
-        try:
-            unapplied_state = self.unapply_state(state, embodiment_tag)
-        except ValueError as e:
-            if "sin/cos encoding" in str(e) and raw_state is None:
-                raise ValueError(
-                    "Cannot unapply sin/cos encoded state. Please provide raw_state parameter."
-                ) from e
-            raise
-
-        # Use provided raw_state if available, otherwise use unapplied state
-        state_for_action = raw_state if raw_state is not None else unapplied_state
-
-        # Unapply action
-        unapplied_action = self.unapply_action(action, embodiment_tag, state=state_for_action)
-
-        return unapplied_state, unapplied_action
-
-    def get_state_dim(self, embodiment_tag: str, include_sincos_expansion: bool = False) -> int:
-        """
-        Get total state dimension after processing.
-
-        Args:
-            embodiment_tag: Embodiment identifier
-            include_sincos_expansion: If True, accounts for sin/cos encoding doubling dimensions
-
-        Returns:
-            Total state dimension across all joint groups
-        """
-        total_dim = 0
-        state_config = self.modality_configs[embodiment_tag]["state"]
-
-        # Get sin/cos embedding keys if enabled
-        sin_cos_keys = set()
-        if self.apply_sincos_state_encoding and hasattr(state_config, "sin_cos_embedding_keys"):
-            sin_cos_keys = set(state_config.sin_cos_embedding_keys)
-
-        for joint_group in state_config.modality_keys:
-            base_dim = self.norm_params[embodiment_tag]["state"][joint_group]["dim"].item()
-
-            # Sin/cos encoding doubles the dimension
-            if include_sincos_expansion and joint_group in sin_cos_keys:
-                total_dim += base_dim * 2
-            else:
-                total_dim += base_dim
-
-        return total_dim
+    def layout(self, embodiment_tag: str, modality: str) -> Layout:
+        params = self.norm_params[embodiment_tag][modality]
+        keys = self.modality_configs[embodiment_tag][modality].modality_keys
+        return {key: params[key].dim for key in keys}
 
     def get_action_dim(self, embodiment_tag: str) -> int:
-        """
-        Get total action dimension.
-
-        Args:
-            embodiment_tag: Embodiment identifier
-
-        Returns:
-            Total action dimension across all joint groups
-        """
-        total_dim = 0
-        for joint_group in self.modality_configs[embodiment_tag]["action"].modality_keys:
-            total_dim += self.norm_params[embodiment_tag]["action"][joint_group]["dim"].item()
-        return total_dim
+        return sum(self.layout(embodiment_tag, "action").values())
 
     def _convert_to_relative_action(
         self,
@@ -701,21 +483,8 @@ class StateActionProcessor:
         assert reference_state.ndim == 1, f"Expected state shape (D,), got {reference_state.shape}"
 
         if action_type == ActionType.EEF:
-            assert action.shape[1] == 9, (
-                f"Expected action dim 9 (xyz + rot6d) for EEF, got {action.shape[1]}"
-            )
-
-            action_chunking = EndEffectorActionChunk(
-                [
-                    EndEffectorPose(translation=m[:3], rotation=m[3:], rotation_type="rot6d")
-                    for m in action
-                ]
-            )
-            reference_frame = EndEffectorPose(
-                translation=reference_state[:3],
-                rotation=reference_state[3:],
-                rotation_type="rot6d",
-            )
+            action_chunking = EndEffectorActionChunk.from_array(action, action_format)
+            reference_frame = EndEffectorPose.from_action_format(reference_state, action_format)
 
         elif action_type == ActionType.NON_EEF:
             action_chunking = JointActionChunk([JointPose(m) for m in action])
@@ -744,21 +513,8 @@ class StateActionProcessor:
         )
 
         if action_type == ActionType.EEF:
-            assert action.shape[1] == 9, (
-                f"Expected action dim 9 (xyz + rot6d) for EEF, got {action.shape[1]}"
-            )
-
-            rel_action = EndEffectorActionChunk(
-                [
-                    EndEffectorPose(translation=m[:3], rotation=m[3:], rotation_type="rot6d")
-                    for m in action
-                ]
-            )
-            reference_frame = EndEffectorPose(
-                translation=reference_state[:3],
-                rotation=reference_state[3:],
-                rotation_type="rot6d",
-            )
+            rel_action = EndEffectorActionChunk.from_array(action, action_format)
+            reference_frame = EndEffectorPose.from_action_format(reference_state, action_format)
 
         elif action_type == ActionType.NON_EEF:
             rel_action = JointActionChunk([JointPose(pose) for pose in action])
@@ -771,4 +527,12 @@ class StateActionProcessor:
         return abs_action.to(action_format)
 
     def __str__(self) -> str:
-        return f"StateActionProcessor(modality_configs={self.modality_configs}, statistics={self.statistics}, use_percentiles={self.use_percentiles}, clip_outliers={self.clip_outliers}, apply_sincos_state_encoding={self.apply_sincos_state_encoding}, use_relative_action={self.use_relative_action})"
+        return (
+            "StateActionProcessor("
+            f"modality_configs={self.modality_configs}, "
+            f"statistics={self.statistics}, "
+            f"use_percentiles={self.use_percentiles}, "
+            f"clip_outliers={self.clip_outliers}, "
+            f"apply_sincos_state_encoding={self.apply_sincos_state_encoding}, "
+            f"use_relative_action={self.use_relative_action})"
+        )

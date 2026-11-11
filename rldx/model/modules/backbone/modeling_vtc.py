@@ -8,10 +8,25 @@ from accelerate import load_checkpoint_in_model
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoProcessor
 
-from rldx.utils.dist import rank_zero_print as _print
+from rldx.dist import rank_zero_print as _print
 
 from .layer_wrapper import LayerWrapper
 from .modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+
+
+COMPRESSION_LAYER = 4
+COMPRESSION_PATTERN_TOKEN_ID = 151652
+
+
+def configure_token_compression(language_model) -> None:
+    for layer_idx, layer in enumerate(language_model.layers):
+        language_model.layers[layer_idx] = LayerWrapper(
+            layer,
+            layer_idx=layer_idx,
+            internal_projection=COMPRESSION_LAYER,
+            img_pattern=[COMPRESSION_PATTERN_TOKEN_ID],
+            motion_token=1,
+        )
 
 
 def _checkpoint_has_motion_weights(
@@ -134,7 +149,7 @@ class VTC_Qwen3VL(Qwen3VLForConditionalGeneration):
         # Re-apply motion module init only when motion module is newly added (not in checkpoint).
         # from_pretrained's _init_weights overwrites kaiming Conv3d init and any
         # custom init applied in MotionModule.initialize_weights().
-        if motion_config is not None and hasattr(model.model.visual, "motion_block"):
+        if motion_config is not None:
             probe = _checkpoint_has_motion_weights(pretrained_model_name_or_path, revision=revision)
             if probe is True:
                 _print(
@@ -155,14 +170,7 @@ class VTC_Qwen3VL(Qwen3VLForConditionalGeneration):
                     "intended, verify the checkpoint layout."
                 )
 
-        for layer_idx in range(len(model.model.language_model.layers)):
-            model.model.language_model.layers[layer_idx] = LayerWrapper(
-                model.model.language_model.layers[layer_idx],
-                layer_idx=layer_idx,
-                internal_projection=4,
-                img_pattern=[151652],
-                motion_token=1,
-            )
+        configure_token_compression(model.model.language_model)
         if "vtc" in pretrained_model_name_or_path.lower():
             if os.path.isdir(pretrained_model_name_or_path):
                 local_dir = pretrained_model_name_or_path

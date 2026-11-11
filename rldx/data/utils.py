@@ -18,7 +18,12 @@
 
 from dataclasses import asdict, is_dataclass
 from enum import Enum
-from typing import Any
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+from typing import Any, Callable, TextIO
 
 import numpy as np
 
@@ -80,11 +85,11 @@ def normalize_values_minmax(values, params):
         values: Input values to normalize
             - Shape: (T, D) or (B, T, D) where B is batch, T is time/step, D is feature dimension
             - Can handle 2D or 3D arrays where last axis represents features
-        params: Dictionary with "min" and "max" keys
-            - params["min"]: Minimum values for normalization
+        params: NormStats; low and high bound the range
+            - params.low: Minimum values for normalization
                 * Case 1 - 1D bounds: Shape (D,) - same min/max for all steps
                 * Case 2 - 2D bounds: Shape (T, D) - different min/max per step
-            - params["max"]: Maximum values for normalization
+            - params.high: Maximum values for normalization
                 * Case 1 - 1D bounds: Shape (D,) - same min/max for all steps
                 * Case 2 - 2D bounds: Shape (T, D) - different min/max per step
 
@@ -96,13 +101,13 @@ def normalize_values_minmax(values, params):
 
     Examples:
         # 1D bounds - same normalization for all steps
-        values: (10, 5), params["min"]: (5,), params["max"]: (5,)
+        values: (10, 5), params.low: (5,), params.high: (5,)
 
         # 2D bounds - per-step normalization
-        values: (8, 4), params["min"]: (8, 4), params["max"]: (8, 4)
+        values: (8, 4), params.low: (8, 4), params.high: (8, 4)
     """
-    min_vals = params["min"]
-    max_vals = params["max"]
+    min_vals = params.low
+    max_vals = params.high
     normalized = np.zeros_like(values)
 
     mask = ~np.isclose(max_vals, min_vals)
@@ -123,11 +128,11 @@ def unnormalize_values_minmax(normalized_values, params):
         normalized_values: Normalized input values in [-1, 1] range
             - Shape: (T, D) or (B, T, D) where B is batch, T is time/step, D is feature dimension
             - Values outside [-1, 1] are automatically clipped
-        params: Dictionary with "min" and "max" keys
-            - params["min"]: Original minimum values used for normalization
+        params: NormStats; low and high bound the range
+            - params.low: Original minimum values used for normalization
                 * Case 1 - 1D bounds: Shape (D,) - same min/max for all steps
                 * Case 2 - 2D bounds: Shape (T, D) - different min/max per step
-            - params["max"]: Original maximum values used for normalization
+            - params.high: Original maximum values used for normalization
                 * Case 1 - 1D bounds: Shape (D,) - same min/max for all steps
                 * Case 2 - 2D bounds: Shape (T, D) - different min/max per step
 
@@ -139,14 +144,14 @@ def unnormalize_values_minmax(normalized_values, params):
 
     Examples:
         # 1D bounds - same unnormalization for all steps
-        normalized_values: (10, 5), params["min"]: (5,), params["max"]: (5,)
+        normalized_values: (10, 5), params.low: (5,), params.high: (5,)
 
         # 2D bounds - per-step unnormalization
-        normalized_values: (8, 4), params["min"]: (8, 4), params["max"]: (8, 4)
+        normalized_values: (8, 4), params.low: (8, 4), params.high: (8, 4)
     """
 
-    min_vals = params["min"]
-    max_vals = params["max"]
+    min_vals = params.low
+    max_vals = params.high
     range_vals = max_vals - min_vals
 
     # Unnormalize from [-1, 1]
@@ -162,11 +167,11 @@ def normalize_values_meanstd(values, params):
         values: Input values to normalize
             - Shape: (T, D) or (B, T, D) where B is batch, T is time/step, D is feature dimension
             - Can handle 2D or 3D arrays where last axis represents features
-        params: Dictionary with "mean" and "std" keys
-            - params["mean"]: Mean values for normalization
+        params: NormStats; mean and std are used
+            - params.mean: Mean values for normalization
                 * Case 1 - 1D params: Shape (D,) - same mean for all steps
                 * Case 2 - 2D params: Shape (T, D) - different mean per step
-            - params["std"]: Standard deviation values for normalization
+            - params.std: Standard deviation values for normalization
                 * Case 1 - 1D params: Shape (D,) - same std for all steps
                 * Case 2 - 2D params: Shape (T, D) - different std per step
 
@@ -178,13 +183,13 @@ def normalize_values_meanstd(values, params):
 
     Examples:
         # 1D params - same normalization for all steps
-        values: (10, 5), params["mean"]: (5,), params["std"]: (5,)
+        values: (10, 5), params.mean: (5,), params.std: (5,)
 
         # 2D params - per-step normalization
-        values: (8, 4), params["mean"]: (8, 4), params["std"]: (8, 4)
+        values: (8, 4), params.mean: (8, 4), params.std: (8, 4)
     """
-    mean_vals = params["mean"]
-    std_vals = params["std"]
+    mean_vals = params.mean
+    std_vals = params.std
 
     # Create mask for non-zero standard deviations
     mask = std_vals != 0
@@ -209,11 +214,11 @@ def unnormalize_values_meanstd(normalized_values, params):
         normalized_values: Normalized input values (z-scores)
             - Shape: (T, D) or (B, T, D) where B is batch, T is time/step, D is feature dimension
             - Can handle 2D or 3D arrays where last axis represents features
-        params: Dictionary with "mean" and "std" keys
-            - params["mean"]: Original mean values used for normalization
+        params: NormStats; mean and std are used
+            - params.mean: Original mean values used for normalization
                 * Case 1 - 1D params: Shape (D,) - same mean for all steps
                 * Case 2 - 2D params: Shape (T, D) - different mean per step
-            - params["std"]: Original standard deviation values used for normalization
+            - params.std: Original standard deviation values used for normalization
                 * Case 1 - 1D params: Shape (D,) - same std for all steps
                 * Case 2 - 2D params: Shape (T, D) - different std per step
 
@@ -225,13 +230,13 @@ def unnormalize_values_meanstd(normalized_values, params):
 
     Examples:
         # 1D params - same unnormalization for all steps
-        normalized_values: (10, 5), params["mean"]: (5,), params["std"]: (5,)
+        normalized_values: (10, 5), params.mean: (5,), params.std: (5,)
 
         # 2D params - per-step unnormalization
-        normalized_values: (8, 4), params["mean"]: (8, 4), params["std"]: (8, 4)
+        normalized_values: (8, 4), params.mean: (8, 4), params.std: (8, 4)
     """
-    mean_vals = params["mean"]
-    std_vals = params["std"]
+    mean_vals = params.mean
+    std_vals = params.std
 
     # Create mask for non-zero standard deviations
     mask = std_vals != 0
@@ -258,13 +263,13 @@ def normalize_values_q99(values, params):
 
     Args:
         values: Input values, shape (T, D) or (B, T, D)
-        params: Dictionary with "q01" and "q99" keys, each shape (D,) or (T, D)
+        params: NormStats whose low and high are q01 and q99, each shape (D,) or (T, D)
 
     Returns:
         Normalized values clipped to [-1, 1], same shape as input.
     """
-    q01_vals = params["q01"]
-    q99_vals = params["q99"]
+    q01_vals = params.low
+    q99_vals = params.high
 
     normalized = np.zeros_like(values, dtype=float)
     mask = ~np.isclose(q99_vals, q01_vals)
@@ -278,28 +283,44 @@ def normalize_values_q99(values, params):
     return normalized
 
 
-def unnormalize_values_q99(normalized_values, params):
-    """
-    Q99 unnormalization from [-1, 1] range back to original range.
-    Args:
-        normalized_values: Normalized input values in [-1, 1] range
-            - Shape: (T, D) or (B, T, D)
-        params: Dictionary with "q01" and "q99" keys
-            - params["q01"]: 1st percentile values used for normalization
-            - params["q99"]: 99th percentile values used for normalization
-    Returns:
-        Unnormalized values in original range [q01, q99]
-            - Same shape as input normalized_values: (T, D) or (B, T, D)
-            - Input values are clipped to [-1, 1] before unnormalization
-    """
-    q01_vals = params["q01"]
-    q99_vals = params["q99"]
-    range_vals = q99_vals - q01_vals
+def write_json_atomic(path: Path | str, payload: Any, *, indent: int = 4) -> None:
+    """Install ``payload`` at ``path`` so a reader never sees a partial file."""
+    _install_atomic(Path(path), lambda f: json.dump(payload, f, indent=indent))
 
-    # [-1, 1] -> [0, 1] -> [q01, q99]
-    unnormalized = (np.clip(normalized_values, -1.0, 1.0) + 1.0) / 2.0 * range_vals + q01_vals
 
-    return unnormalized
+def write_text_atomic(path: Path | str, text: str) -> None:
+    """Install ``text`` at ``path`` so a reader never sees a partial file."""
+    _install_atomic(Path(path), lambda f: f.write(text))
+
+
+def _install_atomic(path: Path, write: Callable[[TextIO], None]) -> None:
+    """Write through a same-directory temporary, then rename onto ``path``.
+
+    A serializer streams a large payload out in pieces, and nothing reads these
+    artifacts back during the run -- a truncated or interleaved write is only
+    noticed by the next stage. The temporary name is unique per writer: a shared
+    one turns two concurrent writers into a ``FileNotFoundError``.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            write(f)
+            f.flush()
+            os.fsync(f.fileno())
+        # `mkstemp` creates 0600 and `os.replace` installs that mode, so without
+        # this the artifact stops being readable by anyone else.
+        try:
+            os.chmod(tmp_name, stat.S_IMODE(path.stat().st_mode))
+        except FileNotFoundError:
+            # What `open` would have left. The umask can only be read by setting
+            # it, so it is restored on the next line.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp_name, 0o666 & ~umask)
+        os.replace(tmp_name, str(path))
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 def to_json_serializable(obj: Any) -> Any:

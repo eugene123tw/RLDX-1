@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 import numpy as np
 import torch
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 """ USAGE (single dataset, single task, inline physics flags):
@@ -441,7 +441,6 @@ def populate_dataset(
 
         for t in range(T):
             frame = {
-                "task": ep_task,
                 "observation.state": ep.state[t],
                 "action": ep.action[t],
             }
@@ -459,7 +458,7 @@ def populate_dataset(
                 img = frames[t]
                 chw = torch.from_numpy(np.transpose(img, (2, 0, 1)))
                 frame[f"observation.images.{cam}"] = chw
-            dataset.add_frame(frame)
+            dataset.add_frame(frame, task=ep_task)
 
         dataset.save_episode()
 

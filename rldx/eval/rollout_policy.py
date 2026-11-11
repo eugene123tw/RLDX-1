@@ -25,17 +25,19 @@ from pathlib import Path
 import random
 import re
 import time
-from typing import Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 import uuid
 
 import gymnasium as gym
 import numpy as np
 import pandas as pd
-from rldx.data.embodiment_tags import EmbodimentTag
-from rldx.eval.sim.env_utils import get_embodiment_tag_from_env_name
+from rldx.eval.sim import rldx_format
 from rldx.eval.sim.wrapper.multistep_wrapper import MultiStepWrapper
-from rldx.policy import BasePolicy
 from tqdm import tqdm
+
+
+if TYPE_CHECKING:
+    from rldx.serving.server import Policy
 
 
 @dataclass
@@ -57,6 +59,9 @@ class VideoConfig:
     video_dir: str | None = None
     steps_per_render: int = 2
     max_episode_steps: int = 720
+    # Per-env recording cap: env_idx stops writing mp4s after this many.
+    # Auto-computed as n_episodes // n_envs when left None.
+    max_episodes_per_env: int | None = None
     fps: int = 20
     codec: str = "h264"
     input_pix_fmt: str = "rgb24"
@@ -102,34 +107,16 @@ def get_robocasa_env_fn(
     env_name: str,
     seed: int = 0,
     robocasa_split: str = "pretrain",
-    embodiment_tag: str = "general_embodiment",
 ):
     def env_fn():
         import os
 
         import robocasa  # noqa: F401
-        from robocasa.utils.gym_utils import GrootRoboCasaEnv  # noqa: F401
         import robosuite  # noqa: F401
 
-        class RoboCasa365ObsKeyRemapWrapper(gym.ObservationWrapper):
-            """Remap RoboCasa365 observation keys to GR00T N1.6 expected keys."""
-
-            def __init__(self, env):
-                super().__init__(env)
-                # Keep keys unchanged unless source key exists in observation space.
-                self._key_map = {
-                    "video.robot0_agentview_left": "video.res256_image_side_0",
-                    "video.robot0_agentview_right": "video.res256_image_side_1",
-                    "video.robot0_eye_in_hand": "video.res256_image_wrist_0",
-                    "annotation.human.task_description": "annotation.human.action.task_description",
-                }
-                mapped_space = {}
-                for key, space in self.observation_space.spaces.items():
-                    mapped_space[self._key_map.get(key, key)] = space
-                self.observation_space = gym.spaces.Dict(mapped_space)
-
-            def observation(self, observation):
-                return {self._key_map.get(k, k): v for k, v in observation.items()}
+        # gym_utils exists only in the Kitchen fork; RoboCasa365 has no such module.
+        if not env_name.startswith("robocasa/"):
+            from robocasa.utils.gym_utils import GrootRoboCasaEnv  # noqa: F401
 
         os.environ["MUJOCO_GL"] = "egl"
         os.environ["PYOPENGL_PLATFORM"] = "egl"
@@ -137,53 +124,8 @@ def get_robocasa_env_fn(
         # require a split argument; the older ``robocasa_panda_omron/``
         # prefix uses enable_render + seed instead.
         if env_name.startswith("robocasa/"):
-            env = gym.make(env_name, split=robocasa_split, seed=seed)
-            # The ``ROBOCASA_PANDA_OMRON`` tag uses a different observation
-            # key naming than native robocasa365; remap on the fly.
-            # GENERAL_EMBODIMENT training/eval expects native robocasa365 keys.
-            if embodiment_tag == EmbodimentTag.ROBOCASA_PANDA_OMRON:
-                env = RoboCasa365ObsKeyRemapWrapper(env)
-            return env
+            return gym.make(env_name, split=robocasa_split, seed=seed)
         return gym.make(env_name, enable_render=True, seed=seed)
-
-    return env_fn
-
-
-def get_groot_locomanip_env_fn(
-    env_name: str,
-):
-    def env_fn():
-        from gr00t_wbc.control.envs.robocasa.sync_env import SyncEnv  # noqa: F401
-        from gr00t_wbc.control.main.teleop.configs.configs import BaseConfig
-        from gr00t_wbc.control.utils.n1_utils import WholeBodyControlWrapper
-        import robocasa  # noqa: F401
-
-        gym_env = gym.make(
-            env_name,
-            onscreen=False,
-            offscreen=True,
-            enable_waist=True,
-            randomize_cameras=False,
-            camera_names=[
-                "robot0_oak_egoview",
-                "robot0_rs_tppview",
-            ],
-        )
-        wbc_config = BaseConfig(wbc_version="gear_wbc", enable_waist=True).to_dict()
-        gym_env = WholeBodyControlWrapper(gym_env, wbc_config)
-        return gym_env
-
-    return env_fn
-
-
-def get_simpler_env_fn(
-    env_name: str,
-):
-    def env_fn():
-        from rldx.eval.sim.SimplerEnv.simpler_env import register_simpler_envs
-
-        register_simpler_envs()
-        return gym.make(env_name)
 
     return env_fn
 
@@ -200,62 +142,21 @@ def get_libero_env_fn(
     return env_fn
 
 
-def get_libero_plus_env_fn(env_name: str):
-    def env_fn():
-        from rldx.eval.sim.LIBERO_PLUS.libero_plus_env import register_libero_plus_envs
-
-        register_libero_plus_envs()
-        return gym.make(env_name)
-
-    return env_fn
-
-
-def get_behavior_env_fn(
-    env_name: str,
-    env_idx: int,
-    total_n_envs: int,
-):
-    def env_fn():
-        from rldx.eval.sim.BEHAVIOR.behavior_env import register_behavior_envs
-
-        register_behavior_envs()
-        return gym.make(env_name, env_idx=env_idx, total_n_envs=total_n_envs)
-
-    return env_fn
-
-
 def get_gym_env(
     env_name: str,
     env_idx: int,
     total_n_envs: int,
     seed: int = 42,
     robocasa_split: str = "pretrain",
-    embodiment_tag: str = "general_embodiment",
 ):
     """Create Ray environment factory function without wrappers."""
 
     if env_name.startswith("robocasa") or env_name.startswith("gr1_unified"):
-        env_fn = get_robocasa_env_fn(
-            env_name, seed=seed, robocasa_split=robocasa_split, embodiment_tag=embodiment_tag
-        )
-    elif env_name.startswith("libero_plus_sim"):
-        env_fn = get_libero_plus_env_fn(env_name)
+        env_fn = get_robocasa_env_fn(env_name, seed=seed, robocasa_split=robocasa_split)
     elif env_name.startswith("libero"):
         env_fn = get_libero_env_fn(env_name)
     else:
-        try:
-            env_embodiment = get_embodiment_tag_from_env_name(env_name)
-        except Exception:
-            env_embodiment = embodiment_tag
-
-        if env_embodiment in (EmbodimentTag.UNITREE_G1,):
-            env_fn = get_groot_locomanip_env_fn(env_name)
-        elif env_embodiment in (EmbodimentTag.OXE_GOOGLE, EmbodimentTag.OXE_WIDOWX):
-            env_fn = get_simpler_env_fn(env_name)
-        elif env_embodiment in (EmbodimentTag.BEHAVIOR_R1_PRO,):
-            env_fn = get_behavior_env_fn(env_name, env_idx, total_n_envs)
-        else:
-            raise ValueError(f"Invalid environment name: {env_name}")
+        raise ValueError(f"Invalid environment name: {env_name}")
 
     return env_fn()
 
@@ -268,13 +169,17 @@ def create_eval_env(
     start_episode_id: int = 0,
     seed: int = 42,
     robocasa_split: str = "pretrain",
+    episode_id_queue: Optional[List[int]] = None,
 ) -> gym.Env:
     """Create a single evaluation environment with wrappers.
 
     Args:
         env_name: Name of the gymnasium environment to use
-        idx: Environment index (used to determine video recording)
+        idx: Environment index (used to determine video recording). This is the GLOBAL
+            index -- the caller has already applied env_idx_offset -- so seeds and video
+            file names follow the lane.
         wrapper_configs: Configuration for environment wrappers
+        episode_id_queue: Explicit episode ids for this env, in order. None counts up.
     Returns:
         Wrapped gymnasium environment
     """
@@ -292,6 +197,20 @@ def create_eval_env(
     )
 
     env = get_gym_env(env_name, env_idx, total_n_envs, seed=env_seed, robocasa_split=robocasa_split)
+
+    # --- GR-1 tabletop reset protocol ---
+    # Inert unless GR1_PROTOCOL_SEED is set. Must wrap the raw env.
+    _gr1_seed = os.environ.get("GR1_PROTOCOL_SEED")
+    if _gr1_seed:
+        from gr1_protocol import GR1ProtocolWrapper
+
+        env = GR1ProtocolWrapper(
+            env,
+            base_seed=int(_gr1_seed) + env_idx,
+            start_episode_id=start_episode_id - 1,
+            episode_id_queue=episode_id_queue,
+        )
+
     if wrapper_configs.video.video_dir is not None:
         from rldx.eval.sim.wrapper.video_recording_wrapper import (
             VideoRecorder,
@@ -314,9 +233,12 @@ def create_eval_env(
             max_episode_steps=wrapper_configs.video.max_episode_steps,
             overlay_text=wrapper_configs.video.overlay_text,
             name_prefix=f"{env_name.replace('/', '_')}_env{env_idx:02d}",
-            base_seed=env_seed,  # per-episode deterministic reset seed (see VideoRecordingWrapper)
+            # Per-episode deterministic reset seed.
+            base_seed=None if _gr1_seed else env_seed,
             seed_stride=100000,  # avoid collisions across env/episode ids
             start_episode_id=start_episode_id - 1,  # reset() will add 1, so set -1 here
+            max_episodes_per_env=wrapper_configs.video.max_episodes_per_env,
+            episode_id_queue=episode_id_queue,  # exact ids this env owes (hole-aware resume)
         )
 
     env = MultiStepWrapper(
@@ -330,9 +252,37 @@ def create_eval_env(
     return env
 
 
+class _RobustAsyncVectorEnv(gym.vector.AsyncVectorEnv):
+    """AsyncVectorEnv that tolerates variable-shaped info arrays across envs.
+
+    Gymnasium's default _add_info pre-allocates a numpy array based on the
+    first env's value shape and then assigns subsequent envs into it.  When
+    envs return differently-shaped values (e.g. variable-length contact arrays)
+    the assignment raises ValueError.  We catch that and fall back to a plain
+    Python list for that key so the rest of the step can proceed normally.
+    """
+
+    def _add_info(self, infos, info, env_num):
+        for k, v in info.items():
+            if k not in infos:
+                infos[k] = [None] * self.num_envs
+                infos[f"_{k}"] = np.zeros(self.num_envs, dtype=bool)
+            if isinstance(infos[k], np.ndarray):
+                try:
+                    infos[k][env_num] = v
+                except (ValueError, TypeError):
+                    lst = list(infos[k])
+                    lst[env_num] = v
+                    infos[k] = lst
+            else:
+                infos[k][env_num] = v
+            infos[f"_{k}"][env_num] = True
+        return infos
+
+
 def run_rollout_gymnasium_policy(
     env_name: str,
-    policy: BasePolicy,
+    policy: "Policy",
     wrapper_configs: WrapperConfigs,
     n_episodes: int = 10,
     n_envs: int = 1,
@@ -340,52 +290,64 @@ def run_rollout_gymnasium_policy(
     seed: int = 42,
     robocasa_split: str = "pretrain",
     verbose: bool = False,
+    env_layout: int = 0,
+    env_idx_offset: int = 0,
 ) -> Any:
     """Run policy rollouts in parallel environments.
 
     Args:
         env_name: Name of the gymnasium environment to use
-        policy_fn: Function that creates a policy instance
+        policy: Policy instance
         n_episodes: Number of episodes to run
         n_envs: Number of parallel environments
         wrapper_configs: Configuration for environment wrappers
         ray_env: Whether to use ray gym env to create each env.
+        env_layout: Lane count of the full layout. >0 marks this run as one chunk of it
+            and enables hole-aware resume even at n_envs=1 (the repair pass). 0 keeps
+            the plain global count-up.
+        env_idx_offset: Lane id this chunk starts at.
     Returns:
         Collection results from running the episodes
     """
     start_time = time.time()
     n_episodes = max(n_episodes, n_envs)
+    # Auto-set the per-env cap so recording splits evenly across envs.
+    if (n_envs > 1 or env_layout > 0) and wrapper_configs.video.max_episodes_per_env is None:
+        wrapper_configs.video.max_episodes_per_env = n_episodes // n_envs
     print(f"Running collecting {n_episodes} episodes for {env_name} with {n_envs} vec envs")
 
-    existing_count, existing_successes, env_to_max_ep = _load_existing_episode_metadata(
-        n_envs, video_dir
+    existing_count, existing_successes, env_to_max_ep, env_to_recorded = (
+        _load_existing_episode_metadata(n_envs, video_dir, env_idx_offset=env_idx_offset)
     )
     print(f"[i] Detected {existing_count} recorded episode(s) across envs; skipping them.")
     print(f"[i] Detected existing_successes: {existing_successes}")
-    if n_envs > 1:
+    # Explicit per-env work list. None on the single-env path, which keeps counting up.
+    env_missing_ids: Optional[List[List[int]]] = None
+    if n_envs > 1 or env_layout > 0:
         target_per_env = int(n_episodes / n_envs)
         target_total = n_episodes
 
-        # env-wise already recorded episode count (file-based)
-        env_episode_counts = []
-        for i in range(n_envs):
-            max_ep = env_to_max_ep.get(i, -1)
-            count = max_ep + 1 if max_ep >= 0 else 0
-            # If already over quota, only count up to quota.
-            env_episode_counts.append(min(count, target_per_env))
+        env_missing_ids = [
+            [ep for ep in range(target_per_env) if ep not in env_to_recorded.get(i, set())]
+            for i in range(n_envs)
+        ]
+        env_episode_counts = [target_per_env - len(m) for m in env_missing_ids]
 
         total_existing = sum(env_episode_counts)
 
         if total_existing > 0:
             print(f"[i] Detected {total_existing} recorded episode(s) across envs; skipping them.")
+        for i, missing in enumerate(env_missing_ids):
+            if missing and missing != list(range(len(missing))):
+                print(f"[i] Env {i}: refilling non-contiguous episode ids {missing}")
 
         if total_existing >= target_total:
             print("[i] Requested episodes per env already recorded. Nothing to run.")
             # Return success list truncated to the number of requested episodes.
             return env_name, existing_successes[:target_total]
 
-        # Episode index for each env (start from 0)
-        env_start_episode_ids = env_episode_counts[:]
+        # First id each env will run; the wrapper gets the whole list and pops per reset.
+        env_start_episode_ids = [m[0] if m else target_per_env for m in env_missing_ids]
         completed_episodes = total_existing
     else:
         # Basic mode: n_episodes = total (global) episode count
@@ -405,13 +367,16 @@ def run_rollout_gymnasium_policy(
     env_fns = [
         partial(
             create_eval_env,
-            env_idx=idx,
+            # env_idx_offset shifts the GLOBAL env index; create_eval_env derives the
+            # seed and the video file name from it.
+            env_idx=idx + env_idx_offset,
             env_name=env_name,
             total_n_envs=n_envs,
             wrapper_configs=wrapper_configs,
             start_episode_id=env_start_episode_ids[idx],
             seed=seed,
             robocasa_split=robocasa_split,
+            episode_id_queue=(list(env_missing_ids[idx]) if env_missing_ids is not None else None),
         )
         for idx in range(n_envs)
     ]
@@ -419,11 +384,17 @@ def run_rollout_gymnasium_policy(
     if n_envs == 1:
         env = gym.vector.SyncVectorEnv(env_fns)
     else:
-        env = gym.vector.AsyncVectorEnv(
+        env = _RobustAsyncVectorEnv(
             env_fns,
             shared_memory=False,
             context="spawn",
         )
+    translation = rldx_format.parse(
+        env_name,
+        policy.get_modality_config(),
+        env.single_observation_space.keys(),
+        env.single_action_space.keys(),
+    )
 
     # Storage for results
     episode_lengths = []
@@ -446,27 +417,34 @@ def run_rollout_gymnasium_policy(
 
     env_episode_indices = env_start_episode_ids.copy()
     completed_episodes = existing_count
+    env_pending: Optional[List[List[int]]] = (
+        [list(m) for m in env_missing_ids] if env_missing_ids is not None else None
+    )
 
-    # Track if this is the first step of an episode for each environment to handle memory resets
+    from rldx.serving.server import memory_options, remaining_chunk, require_cadence, rtc_options
+
     is_first_step = [True] * n_envs
-
-    # Generate unique session IDs for each parallel environment to isolate memory state
-    import uuid
-
-    session_ids = [f"{env_name}_env{idx}_{uuid.uuid4().hex[:8]}" for idx in range(n_envs)]
-    print(f"[rollout_policy] Created {n_envs} session IDs for parallel environments: {session_ids}")
+    rtc = policy.get_rtc()
+    memory = policy.get_memory()
+    require_cadence(rtc, memory, wrapper_configs.multistep.n_action_steps)
+    previous_chunk = None
+    session_ids = [f"{env_name}_env{idx + env_idx_offset}" for idx in range(n_envs)]
 
     pbar = tqdm(total=n_episodes, desc="Episodes")
-    while completed_episodes < n_episodes:
+    # Multi-env stops on the per-env work list, which an index cap cannot
+    # express: a resume may still owe episode 0 out of {0..9}.
+    while True:
         if n_envs > 1:
-            # If all envs have reached the target episode count, break the loop.
-            if all(env_episode_indices[i] >= target_per_env for i in range(n_envs)):
+            if all(not env_pending[i] for i in range(n_envs)):
                 break
         else:
             if completed_episodes >= n_episodes:
                 break
 
-        options = {"reset_memory": is_first_step, "session_ids": session_ids}
+        options = {
+            **rtc_options(rtc, is_first_step, previous_chunk),
+            **memory_options(memory, session_ids, is_first_step),
+        }
 
         if verbose:
             print(f"\n[CLIENT-LOG] === Step {i} ===")
@@ -488,14 +466,14 @@ def run_rollout_gymnasium_policy(
             else:
                 print(f"[CLIENT-LOG] Obs type: {type(observations)}")
 
-        actions, _ = policy.get_action(observations, options=options)
+        actions, _ = policy.get_action(translation.observation(observations), options=options)
+        if rtc is not None:
+            previous_chunk = remaining_chunk(actions, rtc)
 
-        # Reset the flag after passing it to the policy
         is_first_step = [False] * n_envs
-
-        next_obs, rewards, terminations, truncations, env_infos = env.step(actions)
-        # NOTE (FY): Currently we don't properly handle policy reset. For now, our policy are stateless,
-        # but in the future if we need policy to be stateful, we need to detect env reset and call policy.reset()
+        next_obs, rewards, terminations, truncations, env_infos = env.step(
+            translation.env_action(actions)
+        )
         i += 1
         # Update episode tracking
         for env_idx in range(n_envs):
@@ -533,7 +511,11 @@ def run_rollout_gymnasium_policy(
 
             # If episode ended, store results
             if terminations[env_idx] or truncations[env_idx]:
-                if n_envs > 1 and env_episode_indices[env_idx] >= target_per_env:
+                if env_pending is not None and not env_pending[env_idx]:
+                    current_successes[env_idx] = False
+                    current_rewards[env_idx] = 0
+                    current_lengths[env_idx] = 0
+                    is_first_step[env_idx] = True
                     continue
 
                 if "final_info" in env_infos:
@@ -550,17 +532,25 @@ def run_rollout_gymnasium_policy(
 
                 if csv_path is not None:
                     result_stem = "success" if current_successes[env_idx] else "failure"
+                    _global_env_idx = env_idx + env_idx_offset
                     _update_prediction_csv(
                         csv_path=csv_path,
-                        env_idx=env_idx,
+                        env_idx=_global_env_idx,
                         episode_idx=env_episode_indices[env_idx],
                         success=current_successes[env_idx],
                         reward=current_rewards[env_idx],
                         steps=current_lengths[env_idx],
-                        video_path=f"{env_name.replace('/', '_')}_env{env_idx:02d}_episode{env_episode_indices[env_idx]:02d}_{result_stem}.mp4",
+                        video_path=f"{env_name.replace('/', '_')}_env{_global_env_idx:02d}_episode{env_episode_indices[env_idx]:02d}_{result_stem}.mp4",
                     )
 
-                env_episode_indices[env_idx] += 1
+                if env_pending is not None:
+                    if env_pending[env_idx]:
+                        env_pending[env_idx].pop(0)
+                    env_episode_indices[env_idx] = (
+                        env_pending[env_idx][0] if env_pending[env_idx] else target_per_env
+                    )
+                else:
+                    env_episode_indices[env_idx] += 1
 
                 # Reset trackers for this environment.
                 current_successes[env_idx] = False
@@ -654,7 +644,8 @@ def _update_prediction_csv(
 def _load_existing_episode_metadata(
     n_envs: int,
     video_dir: str,
-) -> Tuple[int, List[bool], Dict[int, int]]:
+    env_idx_offset: int = 0,
+) -> Tuple[int, List[bool], Dict[int, int], Dict[int, Set[int]]]:
     """
     Inspect video directory to determine how many episodes were already recorded.
 
@@ -662,17 +653,22 @@ def _load_existing_episode_metadata(
     gr1_unified_..._Env_env00-episode_1-success.mp4
     gr1_unified_..._Env_env03-episode_12-failure.mp4
 
+    `env_idx_offset` shifts file-name env ids into the local 0..n_envs-1 range, so a
+    chunk that runs lane 3 alone bookkeeps it as its own env 0.
+
     Returns:
     - existing_count: number of existing episodes
     - existing_successes: list of success flags for completed episodes
     - env_to_max_ep: dictionary of maximum episode index for each environment (Dict[env_idx, max_episode_idx])
+    - env_to_recorded: recorded episode indices per env (Dict[env_idx, Set[episode_idx]]).
+      A set, not a max: a hole in the middle is invisible to max_ep + 1.
     """
     if video_dir is None:
-        return 0, [], {i: -1 for i in range(n_envs)}
+        return 0, [], {i: -1 for i in range(n_envs)}, {i: set() for i in range(n_envs)}
 
     path = Path(video_dir)
     if not path.exists():
-        return 0, [], {i: -1 for i in range(n_envs)}
+        return 0, [], {i: -1 for i in range(n_envs)}, {i: set() for i in range(n_envs)}
     # gr1_unified_..._Env_env00-episode_1-success.mp4
     pattern = re.compile(
         r".*_Env_env(?P<env>\d+)-episode_(?P<episode>\d+)-(?P<status>success|failure)\.mp4$"
@@ -680,37 +676,43 @@ def _load_existing_episode_metadata(
 
     # env-wise max episode index (for done_max_ep_id calculation)
     env_to_max_ep: Dict[int, int] = {i: -1 for i in range(n_envs)}
+    # env-wise recorded episode indices (hole-aware resume)
+    env_to_recorded: Dict[int, Set[int]] = {i: set() for i in range(n_envs)}
     # flat episode list: (episode_idx, env_idx, success_flag)
     episodes: List[Tuple[int, int, bool]] = []
+    n_other_chunk = 0
 
     for file in path.glob("*.mp4"):
         match = pattern.match(file.name)
         if not match:
-            try:
-                file.unlink()
-                print(f"[i] Removed orphaned video without env/episode/success flag: {file.name}")
-            except OSError as exc:
-                print(f"[warn] Failed to remove orphaned video {file.name}: {exc}")
+            print(f"[warn] Video name not recognised by the resume scan: {file.name}")
             continue
 
-        env_idx = int(match.group("env"))
+        env_idx = int(match.group("env")) - env_idx_offset
         episode_idx = int(match.group("episode"))  # 0-based or 1-based, consistent only
         status = match.group("status")
         success_flag = status == "success"
 
         if env_idx < 0 or env_idx >= n_envs:
-            print(f"[warn] Found video for out-of-range env {env_idx}: {file.name}")
+            n_other_chunk += 1
             continue
 
         # Update the maximum episode index for each environment
         prev_max = env_to_max_ep.get(env_idx, -1)
         env_to_max_ep[env_idx] = max(prev_max, episode_idx)
+        env_to_recorded.setdefault(env_idx, set()).add(episode_idx)
 
         # Add one flat episode
         episodes.append((episode_idx, env_idx, success_flag))
 
+    if n_other_chunk:
+        print(
+            f"[i] Skipped {n_other_chunk} video(s) outside this call's env range "
+            f"[{env_idx_offset}, {env_idx_offset + n_envs}) -- other chunk(s) of the layout."
+        )
+
     if not episodes:
-        return 0, [], env_to_max_ep
+        return 0, [], env_to_max_ep, env_to_recorded
 
     # Sort by episode_idx, env_idx to create a deterministic global order
     episodes.sort(key=lambda x: (x[0], x[1]))
@@ -728,57 +730,30 @@ def _load_existing_episode_metadata(
         if max_ep >= 0:
             print(f"[i] Env {env_idx}: max episode index = {max_ep} (next will be {max_ep + 1})")
 
-    return existing_count, existing_successes, env_to_max_ep
-
-
-def create_rldx_sim_policy(
-    model_path: str,
-    embodiment_tag: EmbodimentTag,
-    policy_client_host: str = "",
-    policy_client_port: int | None = None,
-) -> BasePolicy:
-    from rldx.policy.rldx_policy import RLDXPolicy, RLDXSimPolicyWrapper
-
-    if policy_client_host and policy_client_port:
-        from rldx.policy.server_client import PolicyClient
-
-        policy = PolicyClient(host=policy_client_host, port=policy_client_port)
-    else:
-        policy = RLDXSimPolicyWrapper(
-            RLDXPolicy(
-                embodiment_tag=embodiment_tag,
-                model_path=model_path,
-                device=0,
-            )
-        )
-    return policy
+    return existing_count, existing_successes, env_to_max_ep, env_to_recorded
 
 
 def run_rldx_sim_policy(
     env_name: str,
     n_episodes: int,
     max_episode_steps: int,
-    model_path: str = "",
-    policy_client_host: str = "",
-    policy_client_port: int | None = None,
+    policy_client_host: str,
+    policy_client_port: int,
     n_envs: int = 8,
     n_action_steps: int = 8,
     video_dir: str | None = None,
     seed: int = 42,
     robocasa_split: str = "pretrain",
     verbose: bool = False,
+    env_layout: int = 0,
+    env_idx_offset: int = 0,
 ):
-    embodiment_tag = get_embodiment_tag_from_env_name(env_name)
+    from rldx.serving.server import PolicyClient
 
     if video_dir is None:
-        if model_path:
-            video_dir = f"/tmp/sim_eval_videos_{model_path.split('/')[-3]}_ac{n_action_steps}_{uuid.uuid4()}"
-        else:
-            video_dir = f"/tmp/sim_eval_videos_{env_name}_ac{n_action_steps}_{uuid.uuid4()}"
+        video_dir = f"/tmp/sim_eval_videos_{env_name}_ac{n_action_steps}_{uuid.uuid4()}"
 
-    policy = create_rldx_sim_policy(
-        model_path, embodiment_tag, policy_client_host, policy_client_port
-    )
+    policy = PolicyClient(host=policy_client_host, port=policy_client_port)
 
     modality_configs = policy.get_modality_config()
     video_delta_indices = np.array(modality_configs["video"].delta_indices)
@@ -814,6 +789,8 @@ def run_rldx_sim_policy(
         seed=seed,
         robocasa_split=robocasa_split,
         verbose=verbose,
+        env_layout=env_layout,
+        env_idx_offset=env_idx_offset,
     )
     print("Video saved to: ", wrapper_configs.video.video_dir)
     return results
@@ -830,20 +807,19 @@ if __name__ == "__main__":
         default=504,
     )
     parser.add_argument("--n-episodes", "--n_episodes", dest="n_episodes", type=int, default=50)
-    parser.add_argument("--model-path", "--model_path", dest="model_path", type=str, default="")
     parser.add_argument(
         "--policy-client-host",
         "--policy_client_host",
         dest="policy_client_host",
         type=str,
-        default="",
+        required=True,
     )
     parser.add_argument(
         "--policy-client-port",
         "--policy_client_port",
         dest="policy_client_port",
         type=int,
-        default=None,
+        required=True,
     )
     parser.add_argument(
         "--env-name",
@@ -867,24 +843,30 @@ if __name__ == "__main__":
         choices=["pretrain", "target"],
     )
     parser.add_argument("--verbose", action="store_true", default=False)
+    parser.add_argument(
+        "--env-layout",
+        "--env_layout",
+        dest="env_layout",
+        type=int,
+        default=0,
+        help="Lane count of the full layout. >0 enables hole-aware resume even at "
+        "--n_envs 1 (repair pass). 0 = plain global count-up.",
+    )
+    parser.add_argument(
+        "--env-idx-offset",
+        "--env_idx_offset",
+        dest="env_idx_offset",
+        type=int,
+        default=0,
+        help="Lane id this chunk starts at. Seeds and video file names follow the lane.",
+    )
 
     args = parser.parse_args()
-
-    # validate policy configuration
-    assert (args.model_path and not (args.policy_client_host or args.policy_client_port)) or (
-        not args.model_path and args.policy_client_host and args.policy_client_port is not None
-    ), (
-        "Invalid policy configuration: You must provide EITHER model_path OR (policy_client_host & policy_client_port), not both.\n"
-        "If all 3 arguments are provided, explicitly choose one:\n"
-        '  - To use policy client: set --policy_client_host and --policy_client_port, and set --model_path ""\n'
-        '  - To use model path: set --model_path, and set --policy_client_host "" (and leave --policy_client_port unset)'
-    )
 
     results = run_rldx_sim_policy(
         env_name=args.env_name,
         n_episodes=args.n_episodes,
         max_episode_steps=args.max_episode_steps,
-        model_path=args.model_path,
         policy_client_host=args.policy_client_host,
         policy_client_port=args.policy_client_port,
         n_envs=args.n_envs,
@@ -893,6 +875,8 @@ if __name__ == "__main__":
         seed=args.seed,
         robocasa_split=args.robocasa_split,
         verbose=args.verbose,
+        env_layout=args.env_layout,
+        env_idx_offset=args.env_idx_offset,
     )
     print("results: ", results)
     print("success rate: ", np.mean(results[1]))

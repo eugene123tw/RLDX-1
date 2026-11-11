@@ -5,94 +5,17 @@ in the launcher; this module only mutates config dataclasses.
 """
 
 import copy
-from dataclasses import dataclass
-import os
+from dataclasses import dataclass, replace
 from typing import Optional
 
-from rldx.configs.base_config import Config, get_config
-from rldx.configs.data.dataset_mix import dataset_mix
-from rldx.configs.train_config import TrainConfig
+from rldx.configs.base_config import Config, RunRecord, get_config
+from rldx.configs.data.data_config import DataConfig, SingleDatasetConfig
+from rldx.configs.model.rldx import RLDXConfig
+from rldx.configs.training.cli import TrainArgs
+from rldx.configs.training.runtime import TrainingConfig
+from rldx.dist import rank_zero_print as _print
 from rldx.experiment.features import FEATURES, AssemblyContext, _check_dependencies
-from rldx.experiment.utils import compare_model_configs, resolve_backbone_path
-from rldx.utils.dist import rank_zero_print as _print
-
-
-# ============================================================================
-# Pure helpers (moved verbatim from launch_train.py)
-# ============================================================================
-
-
-def build_dataset_specs(config: TrainConfig, embodiment_tag: str) -> list[dict]:
-    """Build dataset specs for finetune mode (config.data.datasets).
-
-    Accepted forms:
-      - dataset_path -> single dataset
-      - dataset_paths (+ optional dataset_mix_ratios) -> multi-dataset
-    """
-    if config.dataset_paths is not None and len(config.dataset_paths) > 0:
-        dataset_paths = config.dataset_paths
-        if config.dataset_mix_ratios is None:
-            mix_ratios = [1.0] * len(dataset_paths)
-        else:
-            mix_ratios = config.dataset_mix_ratios
-            if len(mix_ratios) != len(dataset_paths):
-                raise ValueError(
-                    f"dataset_mix_ratios length ({len(mix_ratios)}) must match "
-                    f"dataset_paths length ({len(dataset_paths)})"
-                )
-        if any(r <= 0 for r in mix_ratios):
-            raise ValueError("All dataset_mix_ratios must be > 0")
-        return [
-            {
-                "dataset_paths": [path],
-                "mix_ratio": ratio,
-                "embodiment_tag": embodiment_tag,
-            }
-            for path, ratio in zip(dataset_paths, mix_ratios)
-        ]
-
-    if config.dataset_path is None:
-        raise ValueError("Either dataset_path or dataset_paths must be provided for finetune mode")
-    return [
-        {
-            "dataset_paths": [config.dataset_path],
-            "mix_ratio": 1.0,
-            "embodiment_tag": embodiment_tag,
-        }
-    ]
-
-
-def build_pt_dataset_specs(config: TrainConfig) -> list[dict]:
-    """Build dataset specs for pretrain mode from pt_dataset_root and pt_dataset_mix."""
-    pt_dataset_mix_config = dataset_mix[config.pt_dataset_mix]
-    return [
-        {
-            "dataset_paths": [os.path.join(config.pt_dataset_root, d["dataset_name"])],
-            "mix_ratio": d["mix_ratio"],
-            "embodiment_tag": d["embodiment_tag"].value,
-        }
-        for d in pt_dataset_mix_config
-    ]
-
-
-def _assert_dataset_config_mutually_exclusive(config: TrainConfig) -> None:
-    """Assert that finetune and pretrain dataset configs are not used simultaneously."""
-    use_ft = (config.dataset_path is not None) or (
-        config.dataset_paths is not None and len(config.dataset_paths) > 0
-    )
-    use_pt = (config.pt_dataset_root is not None) and (config.pt_dataset_mix is not None)
-    if use_ft and use_pt:
-        raise ValueError(
-            "Finetune and pretrain dataset configs cannot be used simultaneously. "
-            "Use either (dataset_path or dataset_paths) for finetune, "
-            "or (pt_dataset_root + pt_dataset_mix) for pretrain."
-        )
-    if not use_ft and not use_pt:
-        raise ValueError(
-            "Must specify dataset config for either finetune or pretrain mode. "
-            "Finetune: dataset_path or dataset_paths. "
-            "Pretrain: pt_dataset_root and pt_dataset_mix."
-        )
+from rldx.experiment.utils import compare_model_configs, snapshot_model_config
 
 
 # ============================================================================
@@ -104,18 +27,24 @@ def _assert_dataset_config_mutually_exclusive(config: TrainConfig) -> None:
 class AssemblyInputs:
     """All data `assemble_run_config` needs. Caller owns I/O (HF download, YAML read)."""
 
-    cli: TrainConfig
-    datasets: list[dict]
+    cli: TrainArgs
+    datasets: list[SingleDatasetConfig]
     base_model_path: Optional[str] = None
     """Resolved local path to the base checkpoint (``None`` for from-scratch).
     Used by `_apply_training_overrides` to set
     ``run_config.training.start_from_checkpoint``."""
-    loaded_yaml_config: Optional[Config] = None
-    """Populated when base_model_path points to a checkpoint shipping
-    experiment_cfg/config.yaml. None = from-scratch."""
-    loaded_ckpt_model_snapshot: Optional[dict] = None
-    """Snapshot of loaded_yaml_config.model before CLI overrides.
-    Used only for compare_model_configs warning. None = skip the comparison."""
+    base_run: Optional[RunRecord] = None
+    """The run that produced the base checkpoint, read only to identify it; a
+    finetune never starts its settings from it."""
+    checkpoint_model: Optional[RLDXConfig] = None
+    """The base checkpoint's ``config.json``, parsed. A finetune starts its model
+    config here whether or not the checkpoint ships a yaml. None = from-scratch."""
+    modality_jsons: Optional[dict] = None
+    """``{dataset_path: parsed meta/modality.json}`` pre-read at the I/O
+    boundary (launch_train). Used by _derive_modality_dims together with
+    run_config.data.modality_configs (the configs the run actually trains with)
+    to reconcile the concatenated state/action width against
+    max_state_dim/max_action_dim. None = skip the dim-mismatch check."""
 
 
 # ============================================================================
@@ -123,107 +52,68 @@ class AssemblyInputs:
 # ============================================================================
 
 
-def _apply_cli_model_overrides(
-    cli: TrainConfig,
-    run_config: Config,
-    base_model_path: Optional[str],
-    loaded_ckpt_model_snapshot: Optional[dict],
-) -> None:
-    """Replicate launch_train.py L177-204."""
-    run_config.model.model_type = "RLDX-1"
-    run_config.model.tune_llm = cli.tune_llm
-    run_config.model.tune_visual = cli.tune_visual
-    run_config.model.tune_projector = cli.tune_projector
-    run_config.model.tune_diffusion_model = cli.tune_diffusion_model
-    # Action model LoRA. Mirror every CLI knob onto the model config so
-    # the saved config.json records the values the user actually trained
-    # with — skipping any of these would turn the CLI flag into a silent
-    # no-op.
-    run_config.model.action_model_use_lora = cli.action_model_use_lora
-    run_config.model.action_model_lora_rank = cli.action_model_lora_rank
-    run_config.model.action_model_lora_alpha = cli.action_model_lora_alpha
-    run_config.model.action_model_lora_dropout = cli.action_model_lora_dropout
-    if cli.action_model_use_lora and cli.tune_diffusion_model:
-        _print(
-            "[i] action_model_use_lora=True: overriding tune_diffusion_model "
-            "(LoRA adapters control the MSAT trainable state)."
-        )
-    # Backbone (Qwen3 LLM) LoRA. Copy every CLI field onto run_config.model
-    # so the saved config.json records the values the user actually trained
-    # with, and warn when the user combines ``--backbone-use-lora`` with a
-    # nonzero ``--tune-top-llm-layers`` (LoRA owns the LLM trainable surface;
-    # tune_top_llm_layers is silently ignored under LoRA).
-    run_config.model.backbone_use_lora = cli.backbone_use_lora
-    run_config.model.backbone_lora_rank = cli.backbone_lora_rank
-    run_config.model.backbone_lora_alpha = cli.backbone_lora_alpha
-    run_config.model.backbone_lora_dropout = cli.backbone_lora_dropout
-    run_config.model.backbone_lora_num_layers = cli.backbone_lora_num_layers
-    if cli.backbone_use_lora and cli.tune_top_llm_layers > 0:
-        _print(
-            "[i] backbone_use_lora=True: ignoring tune_top_llm_layers "
-            "(LoRA adapters control which LLM layers are adapted)."
-        )
-    run_config.model.state_dropout_prob = cli.state_dropout_prob
-    run_config.model.image_max_area = cli.image_max_area
-    run_config.model.image_resize_m = cli.image_resize_m
-    run_config.model.random_crop_fraction = cli.random_crop_fraction
-    run_config.model.random_rotation_angle = cli.random_rotation_angle
-    run_config.model.color_jitter_params = cli.color_jitter_params
-    # When backbone_use_lora is on, the LoRA adapters own the LLM trainable
-    # surface; copy 0 onto the model config so the warning above matches
-    # behaviour. Otherwise BackboneAdapter would mark the top-N base
-    # weights ``requires_grad=True`` and adapter.py's bf16→fp32 pre-cast
-    # would run, only for ``_apply_backbone_lora`` to immediately re-freeze
-    # them — wasted work, a misleading saved config.json, and a no-op fp32
-    # cast in ``_apply_backbone_lora`` since PEFT inherits fp32 from the
-    # (already-promoted) base layer.
-    run_config.model.tune_top_llm_layers = 0 if cli.backbone_use_lora else cli.tune_top_llm_layers
-    run_config.model.freeze_cog_tokens = cli.freeze_cog_tokens
-    run_config.model.general_embodiment_train_ratio = cli.general_embodiment_train_ratio
-    run_config.model.conversation_image_first = cli.conversation_image_first
+# CLI fields whose model config field has another name or sits in a sub-config.
+_MODEL_FIELD = {
+    "backbone_path": "model_name",
+    "backbone_select_layer": "select_layer",
+    "image_max_area": "image.max_area",
+    "image_resize_m": "image.resize_m",
+    "random_crop_fraction": "image.crop_fraction",
+    "random_rotation_angle": "augmentation.rotation_angle",
+    "color_jitter_params": "augmentation.color_jitter",
+}
 
-    run_config.model.model_name = resolve_backbone_path(
-        cli.backbone_path, base_model_path, loaded_ckpt_model_snapshot
+
+def _set_model_field(model: RLDXConfig, cli_name: str, value) -> None:
+    sub_config, _, name = _MODEL_FIELD.get(cli_name, cli_name).rpartition(".")
+    if sub_config:
+        setattr(model, sub_config, replace(getattr(model, sub_config), **{name: value}))
+    else:
+        setattr(model, name, value)
+
+
+def _apply_cli_model_overrides(cli: TrainArgs, run_config: Config) -> None:
+    model = run_config.model
+    model.model_type = "RLDX-1"
+    for name, value in vars(cli.model.with_defaults()).items():
+        _set_model_field(model, name, value)
+    model.action_model_lora = (
+        None
+        if cli.action_model_lora is None
+        else cli.action_model_lora.to_config(model.action_model_lora)
     )
-    # backbone_model_type is fixed to "vtc_qwen3_vl" at RLDXConfig default.
-    # The CLI does not expose --backbone-model-type and checkpoint values
-    # are ignored here.
-    run_config.model.n_cog_tokens = cli.n_cog_tokens
-    _print(f"[i] n_cog_tokens: {cli.n_cog_tokens}")
-    run_config.model.action_horizon = cli.action_horizon
-    _print(f"[i] action_horizon: {cli.action_horizon}")
+    model.backbone_lora = (
+        None if cli.backbone_lora is None else cli.backbone_lora.to_config(model.backbone_lora)
+    )
 
-    # Plumb CLI fields onto run_config.model.
-    #   * backbone_select_layer: opt-in override (None keeps the ckpt-loaded
-    #     / RLDXConfig default of 18); unconditional copy would overwrite a
-    #     valid ckpt value with None.
-    #   * model_revision: unconditional copy since None means "use HEAD",
-    #     which is the same semantic as the RLDXConfig default.
-    if cli.backbone_select_layer is not None:
-        run_config.model.select_layer = cli.backbone_select_layer
-    run_config.model.model_revision = cli.model_revision
+    given = {name: value for name, value in vars(cli.overrides).items() if value is not None}
+    for name, value in given.items():
+        _set_model_field(model, name, value)
 
-    # Propagate offloadable feature flags so the model is built with exactly
-    # the CLI's choice, even when the loaded checkpoint's yaml has them True.
-    # FeatureModule.apply() also sets these to True when their CLI flag is on,
-    # but it never sets them to False — so we overwrite here from the CLI
-    # side of the ground truth. Video is NOT in this list: ckpt-True + CLI-False
-    # is already rejected by `_validate_features_match_ckpt`.
-    run_config.model.use_memory = cli.use_memory
-    run_config.model.use_motion = cli.use_motion
-    run_config.model.use_physics = cli.use_physics
+    # The backbone keeps the LLM layers up to the deepest select_layer.
+    select = model.select_layer
+    kept = max(select) if isinstance(select, (list, tuple)) else select
+    if model.tune_top_llm_layers > kept:
+        raise ValueError(
+            f"--tune-top-llm-layers {model.tune_top_llm_layers} exceeds the {kept} LLM layers "
+            f"select_layer {select} keeps"
+        )
+    if model.backbone_lora is not None and model.backbone_lora.num_layers > kept:
+        raise ValueError(
+            f"--backbone-lora.num-layers {model.backbone_lora.num_layers} exceeds the {kept} "
+            f"LLM layers select_layer {select} keeps"
+        )
 
-    # RTC: copy every CLI knob so the saved checkpoint config records the
-    # values the user actually trained with. Missing this copy turns
-    # `--rtc-training-max-delay 4` into a silent no-op (model.config keeps the
-    # RLDXConfig default of 0).
-    run_config.model.rtc_training_max_delay = cli.rtc_training_max_delay
-    run_config.model.rtc_inference_mode = cli.rtc_inference_mode
-    run_config.model.rtc_inference_delay = cli.rtc_inference_delay
-    run_config.model.rtc_inference_exec_horizon = cli.rtc_inference_exec_horizon
-    # rtc_jacobian_beta is intentionally not copied: it's an inference-time
-    # guidance knob, not a training-time setting. See RLDXConfig comment.
-    run_config.model.rtc_jacobian_steps_only = cli.rtc_jacobian_steps_only
+    _print(f"[i] n_cog_tokens: {model.n_cog_tokens}")
+    _print(f"[i] action_horizon: {model.action_horizon}")
+
+    # Build the model with exactly the CLI's features, even when the checkpoint has them.
+    # Video is not offloadable: `_validate_features_match_ckpt` rejects dropping it.
+    for name in _OFFLOADABLE_FEATURES:
+        if getattr(cli, name) is None:
+            setattr(model, name, None)
+
+    model.attn_dropout = cli.action_model.attn_dropout
 
 
 # Features that can be offloaded from a pretrained checkpoint (model arch
@@ -233,34 +123,56 @@ def _apply_cli_model_overrides(
 # CLI knob removed), so video is now an architectural invariant — any
 # checkpoint trained with ``use_video=False`` is unsupported and rejected
 # separately at the bottom of this function.
-_OFFLOADABLE_FEATURES: tuple[tuple[str, str], ...] = (
-    ("use_memory", "--use-memory"),
-    ("use_motion", "--use-motion"),
-    ("use_physics", "--use-physics"),
-)
+# Each name is both the model config field and the CLI group (`<name>:on`).
+_OFFLOADABLE_FEATURES = ("memory", "motion", "physics")
 
 
-def _validate_features_match_ckpt(cli, loaded_yaml_config) -> None:
+def _note_boundary_policy_differs_from_ckpt(cli, base_run: Optional[RunRecord]) -> None:
+    """Record when a run starts from a checkpoint trained under another policy.
+
+    ``--base-model-path`` contributes weights only, so differing here is
+    ordinary; a run launched with the wrong flag just looks identical otherwise.
+    The case that must not be silent is resume, which
+    ``assert_resume_matches_boundary_policy`` refuses.
+    """
+    if base_run is None:
+        return  # from-scratch, nothing to compare against.
+
+    ckpt_policy = base_run.episode_boundary_policy
+    cli_policy = cli.data_loading.episode_boundary_policy
+    if ckpt_policy is None:
+        _print(
+            "[i] base checkpoint does not record episode_boundary_policy; "
+            f"this run uses '{cli_policy.value}'"
+        )
+    elif ckpt_policy != cli_policy:
+        _print(
+            f"[i] base checkpoint records episode_boundary_policy='{ckpt_policy.value}'; "
+            f"this run uses '{cli_policy.value}'"
+        )
+
+
+def _validate_features_match_ckpt(cli, ckpt_model: Optional[RLDXConfig]) -> None:
     """Reconcile checkpoint feature flags with CLI flags.
 
     Video is an architectural invariant in the release codebase — a
     pre-release ``use_video=False`` checkpoint is rejected with a clear
     error, since loading non-VTC weights into the VTC backbone would
-    silently mismatch shapes deeper in the load. Memory / motion module /
+    silently mismatch shapes deeper in the load. A LoRA checkpoint keeps its
+    base weights under the adapters, so the run must continue the same
+    adapters. Memory / motion module /
     Physics are soft-offloadable: when the CLI omits the flag the stream is
     dropped from the build and its weights are discarded at load. Going the
     other way (ckpt off, CLI on) is always allowed.
     """
-    if loaded_yaml_config is None:
+    if ckpt_model is None:
         return  # from-scratch, no checkpoint to compare against.
-
-    ckpt_model = loaded_yaml_config.model
 
     # Fatal: a checkpoint without VTC weights cannot be loaded into the
     # release-codebase VTC backbone. Default ``use_video=True`` here
-    # matches the ``RLDXConfig`` default, so older yaml dumps that lack
+    # matches the ``RLDXConfig`` default, so older configs that lack
     # the field are treated as VTC-shaped rather than rejected.
-    if not getattr(ckpt_model, "use_video", True):
+    if not ckpt_model.use_video:
         raise ValueError(
             "Checkpoint was trained with use_video=False (vanilla Qwen3 "
             "backbone). The release codebase only supports the VTC backbone "
@@ -269,20 +181,34 @@ def _validate_features_match_ckpt(cli, loaded_yaml_config) -> None:
             "RLWRLD/RLDX-1-* checkpoint qualifies)."
         )
 
+    # A LoRA checkpoint keeps its base weights under the adapters.
+    saved = ckpt_model.backbone_lora
+    if saved is not None and (
+        cli.backbone_lora is None or cli.backbone_lora.to_config(saved) != saved
+    ):
+        raise ValueError(f"Checkpoint was trained with backbone-lora:on {saved}; pass the same.")
+    saved = ckpt_model.action_model_lora
+    if saved is not None and (
+        cli.action_model_lora is None or cli.action_model_lora.to_config(saved) != saved
+    ):
+        raise ValueError(
+            f"Checkpoint was trained with action-model-lora:on {saved}; pass the same."
+        )
+
     # Soft: memory / motion / physics off → CLI wins. Log so the user isn't
     # surprised when the pretrained weights for those streams get dropped.
     offloaded = [
-        (attr, flag)
-        for attr, flag in _OFFLOADABLE_FEATURES
-        if getattr(ckpt_model, attr, False) and not getattr(cli, attr, False)
+        name
+        for name in _OFFLOADABLE_FEATURES
+        if getattr(ckpt_model, name) is not None and getattr(cli, name) is None
     ]
     if offloaded:
         lines = [
             "[feature offload] Checkpoint has features enabled that the CLI disables. "
             "These streams will be dropped for this run (ckpt weights ignored):"
         ]
-        for attr, flag in offloaded:
-            lines.append(f"  - ckpt {attr}=True, CLI {flag} not set → disabled")
+        for name in offloaded:
+            lines.append(f"  - ckpt {name} on, CLI {name}:on not given → disabled")
         _print("\n".join(lines))
 
 
@@ -309,82 +235,193 @@ def _validate_action_horizon_matches_modality(
             )
 
 
+# Tags a user's own robot trains under; the base only has a mapping for its dims if an
+# earlier run (e.g. the user's mid-train) trained this robot under the same tag.
+_SHARED_SLOT_TAGS = ("general_embodiment", "new_embodiment")
+
+
+def _warn_frozen_projector_on_shared_slots(
+    tune_projector: bool, used_embodiment_tags: set[str]
+) -> None:
+    if tune_projector:
+        return
+    frozen = sorted(set(_SHARED_SLOT_TAGS) & used_embodiment_tags)
+    if frozen:
+        _print(
+            f"[w] --no-tune-projector freezes the state/action encoders and decoder of "
+            f"{frozen}. Unless the base checkpoint already trained this robot (same "
+            f"state/action layout) under that tag, dims it never trained stay at their "
+            f"random init and this embodiment will not be learned properly. Drop "
+            f"--no-tune-projector in that case."
+        )
+
+
+def _derive_modality_dims(
+    datasets: list[SingleDatasetConfig],
+    modality_configs: dict,
+    modality_jsons: dict[str, dict],
+) -> tuple[int, int]:
+    """Largest concatenated (state_dim, action_dim) across ``datasets``.
+
+    Uses ``modality_configs`` — the configs the run will actually train with
+    (``run_config.data.modality_configs``), not the module-global registry, so
+    the derived width matches the keys ``RLDXProcessor`` concatenates even on
+    the checkpoint-YAML path — and the per-dataset ``modality_jsons`` slices
+    pre-read at the I/O boundary. The dim is the sum of ``end - start`` over the
+    config's state/action ``modality_keys``.
+
+    Fail-fast over silent under-validation: an unregistered embodiment, a
+    dataset whose modality.json was not provided, a configured state/action key
+    absent from it, or an invalid ``end <= start`` slice all raise with
+    dataset/key context. Returning 0 in those cases would let a malformed or
+    larger dataset silently lower the max so the assembly guard passes, only for
+    the processor pad step to crash mid-training. A modality the config does not
+    declare contributes 0 (nothing to concatenate) and is not an error.
+    """
+    max_state, max_action = 0, 0
+    for spec in datasets:
+        emb = spec.embodiment_tag
+        mods = modality_configs.get(emb)
+        if mods is None:
+            raise ValueError(
+                f"embodiment_tag {emb!r} is not registered in the run's modality "
+                f"configs (datasets={spec.dataset_paths}). Load the matching "
+                f"--modality-config-path or correct --data.embodiment-tag."
+            )
+        for path in spec.dataset_paths:
+            meta = modality_jsons.get(path)
+            if meta is None:
+                raise ValueError(
+                    f"modality.json for dataset {path!r} was not provided; cannot "
+                    f"determine its state/action width."
+                )
+            for modality in ("state", "action"):
+                if modality not in mods:
+                    continue
+                total = 0
+                for key in mods[modality].modality_keys:
+                    grp = meta.get(modality, {}).get(key)
+                    if not isinstance(grp, dict) or "start" not in grp or "end" not in grp:
+                        raise ValueError(
+                            f"modality config {modality} key {key!r} is missing or has "
+                            f"no start/end slice in {path}/meta/modality.json; cannot "
+                            f"determine the concatenated {modality} width."
+                        )
+                    start, end = int(grp["start"]), int(grp["end"])
+                    if end <= start:
+                        raise ValueError(
+                            f"invalid slice for {modality} key {key!r} in "
+                            f"{path}/meta/modality.json: end={end} <= start={start}."
+                        )
+                    total += end - start
+                if modality == "state":
+                    max_state = max(max_state, total)
+                else:
+                    max_action = max(max_action, total)
+    return max_state, max_action
+
+
+def _resolve_dim_mismatch(
+    allow_dim_mismatch: bool,
+    model_config,
+    derived_state_dim: int,
+    derived_action_dim: int,
+) -> None:
+    """Reconcile the modality-config-derived state/action input width with the
+    model's ``max_state_dim`` / ``max_action_dim``.
+
+    ``max_state_dim`` / ``max_action_dim`` are the state/action projector input
+    widths: the processor zero-pads the concatenated input up to them, and they
+    are baked into the projector weights at build time. The derived dim (sum of
+    end-start over the modality config's keys; ``0`` = could not resolve from
+    modality.json → skip) is the true unpadded width the projectors must hold.
+
+    When a derived dim exceeds its ``max_*_dim``:
+      * ``allow_dim_mismatch=False`` (default) → raise ValueError. Without this
+        the processor's pad step (``max_dim - dim``) goes negative and crashes
+        with an opaque ``negative dimension`` error deep in collation.
+      * ``allow_dim_mismatch=True`` → grow ``max_*_dim`` to the derived value.
+        The affected projector tensors then shape-mismatch the checkpoint and
+        are re-initialized for ALL embodiment slots (the projector weight is a
+        single ``[num_categories, dim, ...]`` tensor), losing the pretrained
+        warm-start for that projection. Pair with ``--new-param-warmup-steps``.
+    """
+    for name, label, derived, projector in (
+        (
+            "max_state_dim",
+            "state",
+            derived_state_dim,
+            "state_encoder.layer1",
+        ),
+        (
+            "max_action_dim",
+            "action",
+            derived_action_dim,
+            "action_encoder.W1 + action_decoder.layer2",
+        ),
+    ):
+        current = getattr(model_config, name)
+        if derived <= current:
+            continue
+        if not allow_dim_mismatch:
+            raise ValueError(
+                f"modality config produces {label} dim={derived} > {name}={current}. "
+                f"The {label} projector input width is fixed at build time, so the "
+                f"processor cannot pad to a larger dim (it would crash with a negative "
+                f"pad size). Pass --allow-dim-mismatch to grow {name} to {derived} and "
+                f"re-initialize {projector} for ALL embodiment slots (PT warm-start for "
+                f"that projection is lost; pair with --new-param-warmup-steps), or fix "
+                f"the modality config so the concatenated {label} dim fits within {current}."
+            )
+        _print(
+            f"[allow-dim-mismatch] {name}: {current} -> {derived} (modality-config "
+            f"derived {label} dim). {projector} will be RE-INITIALIZED for ALL "
+            f"embodiment slots — PT warm-start for that projection is lost. "
+            f"Consider --new-param-warmup-steps to ease the new params in."
+        )
+        setattr(model_config, name, derived)
+
+
 # ============================================================================
 # Orchestrator
 # ============================================================================
 
 
 def _load_base_config(inputs: AssemblyInputs) -> Config:
-    """Build the base run_config prior to any CLI overrides.
+    """Defaults, with the base checkpoint's model config when there is one."""
+    run_config = get_config("RLDX-1")
+    if inputs.checkpoint_model is not None:
+        run_config.model = copy.deepcopy(inputs.checkpoint_model)
 
-    - loaded_yaml_config is not None: start from the deepcopied YAML'd Config
-      (checkpoint shipped experiment_cfg/config.yaml).
-    - loaded_yaml_config is None: start from a fresh `get_config("RLDX-1")`.
-
-    In both cases we call load_dict({"data": ...}) to inject the CLI-built
-    dataset specs and reset data.download_cache. Note that DataConfig's
-    default_factory for modality_configs returns the shared module-level
-    MODALITY_CONFIGS dict (data_config.py L50-52); since the feature-block
-    appliers mutate delta_indices in place, we deepcopy modality_configs here
-    to prevent state leaking across successive assemble_run_config calls.
-    """
-    if inputs.loaded_yaml_config is not None:
-        run_config = copy.deepcopy(inputs.loaded_yaml_config)
-    else:
-        run_config = get_config("RLDX-1")
-
-    run_config.load_dict({"data": {"download_cache": False, "datasets": inputs.datasets}})
+    run_config.data = DataConfig(
+        **vars(inputs.cli.data_loading), download_cache=False, datasets=list(inputs.datasets)
+    )
     run_config.load_config_path = None
-    run_config.data.modality_configs = copy.deepcopy(run_config.data.modality_configs)
     return run_config
 
 
 def _apply_training_overrides(
-    cli: TrainConfig,
+    cli: TrainArgs,
     run_config: Config,
     base_model_path: Optional[str],
 ) -> None:
-    """Apply CLI → run_config.training and run_config.data (non-modality) fields.
-
-    Extracted from launch_train.py's inline post-assembly block. Separate from
-    ``_apply_cli_model_overrides`` because these fields configure the Trainer
-    and the dataloader, not the model architecture.
-    """
+    """Build run_config.training from the CLI; the trainer reads it, not the model."""
     _print("\n2. Overwriting with CLI 'training' configs...")
-    run_config.training.start_from_checkpoint = base_model_path if cli.base_model_path else None
-    run_config.training.optim = cli.optim
-    run_config.training.max_grad_norm = cli.max_grad_norm
-    run_config.training.global_batch_size = cli.global_batch_size
-    run_config.training.dataloader_num_workers = cli.dataloader_num_workers
-    run_config.training.learning_rate = cli.learning_rate
-    run_config.training.lr_scheduler_type = cli.lr_scheduler_type
-    run_config.training.gradient_accumulation_steps = cli.gradient_accumulation_steps
-    run_config.training.output_dir = cli.output_dir
-    run_config.training.save_steps = cli.save_steps
-    run_config.training.save_total_limit = cli.save_total_limit
-    run_config.training.num_gpus = cli.num_gpus
-    run_config.training.use_wandb = cli.use_wandb
-    run_config.training.max_steps = cli.max_steps
-    run_config.training.weight_decay = cli.weight_decay
-    run_config.training.warmup_ratio = cli.warmup_ratio
-    run_config.training.wandb_project = cli.wandb_project
-    run_config.training.experiment_name = cli.experiment_name
-    run_config.training.new_param_warmup_steps = cli.new_param_warmup_steps
-    run_config.data.dataset_mode = cli.dataset_mode
-    run_config.data.shard_size = cli.shard_size
-    run_config.data.episode_sampling_rate = cli.episode_sampling_rate
-    run_config.data.num_shards_per_epoch = cli.num_shards_per_epoch
+    run_config.training = TrainingConfig(
+        **vars(cli.training),
+        wandb=cli.wandb,
+        start_from_checkpoint=base_model_path if cli.base_model_path else None,
+    )
 
 
 def assemble_run_config(inputs: AssemblyInputs) -> Config:
-    """Compose the run_config from CLI + (optional) loaded YAML/snapshot.
+    """Compose the run_config from defaults, the base checkpoint's model config and the CLI.
 
     Pure: no file I/O, no HF download, no Trainer start. Callers must have
-    already resolved base_model_path, downloaded the model, and loaded any
-    experiment_cfg/config.yaml.
+    already resolved base_model_path and downloaded the model.
 
     Flow:
-      1. Load base Config (from YAML or defaults)
+      1. Load base Config (defaults + checkpoint config.json)
       2. Apply non-feature CLI model overrides (always)
       3. Check FeatureDependency across active features (T-E)
       4. Apply each active feature's mutation via the Registry
@@ -393,13 +430,23 @@ def assemble_run_config(inputs: AssemblyInputs) -> Config:
     """
     _print("\n1. Overwriting with CLI 'model' configs...")
     run_config = _load_base_config(inputs)
-    _validate_features_match_ckpt(inputs.cli, inputs.loaded_yaml_config)
-    _apply_cli_model_overrides(
-        inputs.cli,
-        run_config,
-        inputs.base_model_path,
-        inputs.loaded_ckpt_model_snapshot,
-    )
+    _validate_features_match_ckpt(inputs.cli, inputs.checkpoint_model)
+    _note_boundary_policy_differs_from_ckpt(inputs.cli, inputs.base_run)
+    _apply_cli_model_overrides(inputs.cli, run_config)
+    # modality_jsons is None for callers that don't exercise the dim check;
+    # launch_train always supplies it.
+    if inputs.modality_jsons is not None:
+        derived_state_dim, derived_action_dim = _derive_modality_dims(
+            inputs.datasets,
+            run_config.data.modality_configs,
+            inputs.modality_jsons,
+        )
+        _resolve_dim_mismatch(
+            inputs.cli.allow_dim_mismatch,
+            run_config.model,
+            derived_state_dim,
+            derived_action_dim,
+        )
 
     ctx = AssemblyContext(cli=inputs.cli, run_config=run_config)
     active = tuple(F for F in FEATURES if F.is_active(inputs.cli))
@@ -409,13 +456,17 @@ def assemble_run_config(inputs: AssemblyInputs) -> Config:
     ctx.finalize()
 
     _validate_action_horizon_matches_modality(
-        inputs.cli.action_horizon,
+        inputs.cli.model.action_horizon,
         run_config.data.modality_configs,
-        used_embodiment_tags={ds["embodiment_tag"] for ds in inputs.datasets},
+        used_embodiment_tags={ds.embodiment_tag for ds in inputs.datasets},
+    )
+    _warn_frozen_projector_on_shared_slots(
+        run_config.model.tune_projector,
+        used_embodiment_tags={ds.embodiment_tag for ds in inputs.datasets},
     )
 
-    if inputs.loaded_ckpt_model_snapshot is not None:
-        compare_model_configs(inputs.loaded_ckpt_model_snapshot, run_config.model)
+    if inputs.checkpoint_model is not None:
+        compare_model_configs(snapshot_model_config(inputs.checkpoint_model), run_config.model)
 
     _apply_training_overrides(inputs.cli, run_config, inputs.base_model_path)
 

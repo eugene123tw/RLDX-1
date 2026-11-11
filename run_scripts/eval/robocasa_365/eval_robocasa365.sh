@@ -3,17 +3,19 @@ set -euo pipefail
 
 # Usage:
 #   bash run_scripts/eval/robocasa_365/eval_robocasa365.sh \
-#     --model-path RLWRLD/RLDX-1-FT-RC365 \
+#     --model-path RLWRLD/RLDX-1.1-FT-RC365 \
 #     --task-set target50 \
-#     --split target
+#     --split pretrain
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_REPO="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-PY365_DEFAULT="$PROJECT_REPO/rldx/eval/sim/robocasa365/robocasa365_uv/.venv/bin/python"
+PY365_DEFAULT="$PROJECT_REPO/run_scripts/eval/robocasa_365/robocasa365_uv/.venv/bin/python"
 
 MODEL_PATH=""
 TASK_SET="target50"
-SPLIT="target"
+# RoboCasa's multi-task benchmark evaluates pretraining-data models in pretrain
+# scenes; use --split target for models fine-tuned on the target datasets.
+SPLIT="pretrain"
 N_EPISODES=50
 N_ENVS=5
 N_ACTION_STEPS=8
@@ -21,11 +23,10 @@ MAX_EPISODE_STEPS=720
 EMBODIMENT_TAG="GENERAL_EMBODIMENT"
 SERVER_HOST="127.0.0.1"
 SERVER_BIND_HOST="127.0.0.1"
-SERVER_PORT=5555
+SERVER_PORT=""
 SERVER_DEVICE="cuda"
 PY365="${PY365:-$PY365_DEFAULT}"
-OUTPUT_ROOT="$PROJECT_REPO/output/robocasa365_eval"
-SERVER_WARMUP_SEC=20
+OUTPUT_ROOT="${MODEL_OUTPUT_DIR:-$PROJECT_REPO/output}/robocasa365_eval"
 TASK_YAML="$PROJECT_REPO/run_scripts/eval/robocasa_365/task_sets.yaml"
 NUM_SHARDS=1
 SHARD_INDEX=0
@@ -58,7 +59,6 @@ while [[ $# -gt 0 ]]; do
     --server-device) SERVER_DEVICE="$2"; shift 2 ;;
     --python) PY365="$2"; shift 2 ;;
     --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
-    --server-warmup-sec) SERVER_WARMUP_SEC="$2"; shift 2 ;;
     --task-yaml) TASK_YAML="$2"; shift 2 ;;
     --num-shards) NUM_SHARDS="$2"; USER_SET_NUM_SHARDS=1; shift 2 ;;
     --shard-index) SHARD_INDEX="$2"; USER_SET_SHARD_INDEX=1; shift 2 ;;
@@ -360,18 +360,68 @@ cleanup() {
 }
 trap cleanup EXIT
 
+port_is_free() {
+  python3 -c "
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+sys.exit(1 if s.connect_ex(('$SERVER_HOST', $1)) == 0 else 0)
+" 2>/dev/null
+}
+
+# The server binds only after the checkpoint loads, so shards starting together
+# all see a fixed port free and all but one die on bind. A per-run port band, one
+# port per shard, as in the RoboCasa Kitchen launcher.
+if [[ -z "$SERVER_PORT" ]]; then
+  SERVER_PORT=$(( 20000 + ($$ % 120) * 100 + SHARD_INDEX % 100 ))
+fi
+# An occupied port must never be adopted: rolling out against it would evaluate
+# another run's model.
+REQUESTED_PORT="$SERVER_PORT"
+probe=0
+while ! port_is_free "$SERVER_PORT"; do
+  probe=$((probe + 1))
+  if (( probe > 40 )); then
+    echo "[x] No free port in ${REQUESTED_PORT}..${SERVER_PORT}"
+    exit 1
+  fi
+  SERVER_PORT=$((SERVER_PORT + 1))
+done
+if [[ "$SERVER_PORT" != "$REQUESTED_PORT" ]]; then
+  echo "[i] Port $REQUESTED_PORT was busy; using $SERVER_PORT instead"
+fi
+
+# Checked for liveness on every poll: a server that died (e.g. on bind) fails
+# the run here instead of leaving every rollout waiting on nothing.
+SERVER_WAIT_POLLS="${SERVER_WAIT_POLLS:-450}"   # x2s = 15 minutes
+
+wait_for_server() {
+  for _ in $(seq 1 "$SERVER_WAIT_POLLS"); do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "[x] Policy server exited before serving -- see $SERVER_LOG_PATH"
+      return 1
+    fi
+    if ! port_is_free "$SERVER_PORT"; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "[x] Server on port $SERVER_PORT never came up -- see $SERVER_LOG_PATH"
+  return 1
+}
+
 uv run python "$PROJECT_REPO/rldx/eval/run_rldx_server.py" \
   --model-path "$MODEL_PATH" \
   --embodiment-tag "$EMBODIMENT_TAG" \
-  --use-sim-policy-wrapper \
   --host "$SERVER_BIND_HOST" \
   --port "$SERVER_PORT" \
   --device "$SERVER_DEVICE" \
   > "$SERVER_LOG_PATH" 2>&1 &
 SERVER_PID=$!
 
-echo "[i] Server started (pid=$SERVER_PID), warming up ${SERVER_WARMUP_SEC}s..."
-sleep "$SERVER_WARMUP_SEC"
+echo "[i] Server started (pid=$SERVER_PID) on port $SERVER_PORT, waiting for it to listen..."
+wait_for_server || exit 1
+echo "[i] Server ready"
 
 SUMMARY_CSV="$RUN_DIR/summary_${SHARD_TAG}.csv"
 echo "task,success_rate,log_file" > "$SUMMARY_CSV"
@@ -494,6 +544,3 @@ fi
 
 echo "[i] Finished. Summary: $SUMMARY_CSV"
 echo "[i] Shard mean success rate: $SHARD_MEAN"
-echo "[i] To log merged summary to same W&B run after all shards finish:"
-echo "    WANDB_PROJECT=\"$WANDB_PROJECT\" WANDB_ENTITY=\"$WANDB_ENTITY\" WANDB_RUN_ID=\"${WANDB_RUN_ID:-}\" WANDB_RUN_NAME=\"${WANDB_RUN_NAME:-}\" \\"
-echo "    uv run --with wandb python run_scripts/eval/robocasa_365/upload_merged_eval_to_wandb.py --exp-dir \"$EXP_DIR\" --split \"$SPLIT\" --task-set \"$TASK_SET\""

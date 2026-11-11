@@ -1,26 +1,26 @@
 # Evaluation
 
-This doc covers how to run a trained RLDX-1 checkpoint on each of the
+This doc covers how to run a trained RLDX-1.1 checkpoint on each of the
 simulator benchmarks the repo ships with, plus the general
 server/client architecture those evals use.
 
 ## Architecture (why there are two processes)
 
-RLDX-1 evaluation splits cleanly into two processes:
+RLDX-1.1 evaluation splits cleanly into two processes:
 
 ```
   ┌─────────────────────────┐       ZeroMQ         ┌───────────────────────┐
   │ run_rldx_server.py      │ ───────────────────▶ │  simulator rollout    │
   │ (training env .venv)    │ ◀─────────────────── │  (per-sim eval venv)  │
-  │ loads RLDX-1, holds GPU │   observations /     │  mujoco/robosuite/... │
-  │ answers policy queries  │   actions            │  no RLDX imports      │
+  │ loads RLDX-1.1 on GPU   │   observations /     │  mujoco/robosuite/... │
+  │ answers policy queries  │   actions            │  no model weights     │
   └─────────────────────────┘                      └───────────────────────┘
 ```
 
 The **model server** lives in the main training venv (`.venv/`), loads
-the RLDX-1 checkpoint onto the GPU, and listens on a TCP port via ZeroMQ.
+the RLDX-1.1 checkpoint onto the GPU, and listens on a TCP port via ZeroMQ.
 The **rollout process** lives in a **simulator-specific uv venv** (for
-example `rldx/eval/sim/robocasa/robocasa_uv/.venv`), steps the
+example `run_scripts/eval/robocasa_kitchen/robocasa_uv/.venv`), steps the
 environment, serialises observations to the server, and applies the
 returned action chunks. This split exists because the mujoco/robosuite
 stacks conflict with the `torch==2.7 + flash-attn` pins required by
@@ -38,44 +38,52 @@ rollout writes videos + a CSV summary under `output_final/{benchmark}/`.
 |---|---|---|
 | `--model-path` | *(required)* | HF hub id or local checkpoint path. The processor is loaded from `{model_path}/processor` automatically. |
 | `--embodiment-tag` | `GENERAL_EMBODIMENT` | Which category-specific encoder/decoder head to use. See `rldx/data/embodiment_tags.py` for the full list. |
-| `--use-sim-policy-wrapper` | False | Wraps `RLDXPolicy` in `RLDXSimPolicyWrapper`, which reshapes observations and action chunks to the layout simulator eval expects. **Always on for sim eval.** |
-| `--host` / `--port` | `127.0.0.1 / 5555` | Where the server listens. `5555` is `DEFAULT_MODEL_SERVER_PORT` in `run_rldx_server.py`; the examples below use an arbitrary port like `20100` when running multiple servers on one host. |
+| `--host` / `--port` | `0.0.0.0 / 5555` | Where the server listens. `5555` is `DEFAULT_MODEL_SERVER_PORT` in `rldx/serving/server.py`; the examples below use an arbitrary port like `20100` when running multiple servers on one host. |
 | `--deactivate-memory` | False | Loads a memory-trained checkpoint as non-memory model for the "ablation without memory" study. |
-| `--sample-timestep-from-beta-dist` | False | Use a Beta-distributed denoising timestep instead of uniform. |
-| `--denoising-timesteps` | None | Override the default `num_inference_timesteps = 4`. |
+| `--sample-timestep-from-beta-dist` | False | Use a Beta-distributed denoising timestep instead of uniform. Not with a forward-CUDA-graph runtime profile. |
+| `--denoising-timesteps` | None | Explicit list of denoising timesteps; overrides the uniform and Beta schedules. |
 
 ### Rollout runner — `rldx/eval/rollout_policy.py`
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--env-name` | *(required)* | Gym env id. Format depends on the benchmark (see below). |
+| `--env-name` | a GR-1 task | Gym env id. Format depends on the benchmark (see below). |
 | `--n-episodes` | 50 | Total episodes to run. Split across `n_envs`. |
 | `--n-envs` | 8 | Vectorised sim envs. >1 requires robosuite to support async; set to 1 if unsure. |
 | `--n-action-steps` | 8 | Execution horizon per action chunk (must be ≤ `action_horizon`). |
 | `--max-episode-steps` | 504 | Max steps per episode before truncation. |
 | `--policy-client-host/port` | *(required)* | Must match the server. |
-| `--video-dir` | *(required)* | Output directory for `.mp4` files and `simulation_results.csv`. Resume logic auto-skips already-recorded episodes in the same dir. |
+| `--video-dir` | None | Output directory for `.mp4` files and `simulation_results.csv`. Resume logic auto-skips already-recorded episodes in the same dir. |
 
 ## RoboCasa kitchen (24 tasks)
 
-Canonical SLURM script:
-[`run_scripts/eval/robocasa_kitchen/eval_robocasa.sh`](../run_scripts/eval/robocasa_kitchen/eval_robocasa.sh)
+Launcher: [`eval_robocasa.sh`](../run_scripts/eval/robocasa_kitchen/eval_robocasa.sh)
+— 24 tasks, 50 episodes each, 8 shards. GR-1's
+[`eval_gr1.sh`](../run_scripts/eval/gr1_tabletop/eval_gr1.sh) takes the same shape.
 
-Canonical local parallel launcher (4 GPUs, no SLURM):
-[`run_scripts/eval/robocasa_kitchen/eval_robocasa.sh`](../run_scripts/eval/robocasa_kitchen/eval_robocasa.sh)
+```bash
+bash run_scripts/eval/robocasa_kitchen/eval_robocasa.sh RLWRLD/RLDX-1.1-FT-ROBOCASA
+```
 
-Single-task example:
+The launcher runs all 8 shards on this machine, one per visible GPU at a time
+(`N_GPUS=<n>` limits that), then the view-swap repair and the score. Each shard
+starts its own policy server, so the card count changes only the wall-clock.
+`SHARD_ID=<k>` runs one shard alone, for a scheduler that gives each shard a
+card of its own; see the
+[RoboCasa README](../run_scripts/eval/robocasa_kitchen/README.md).
+
+Single-task example, outside the protocol (one env, no manifest, no swap
+repair) -- useful for debugging, not for the reported number:
 
 ```bash
 # Terminal 1 — model server
 uv run python rldx/eval/run_rldx_server.py \
-    --model-path RLWRLD/RLDX-1-FT-ROBOCASA \
+    --model-path RLWRLD/RLDX-1.1-FT-ROBOCASA \
     --embodiment-tag GENERAL_EMBODIMENT \
-    --use-sim-policy-wrapper \
     --host 127.0.0.1 --port 20100
 
 # Terminal 2 — rollout in the robocasa venv
-rldx/eval/sim/robocasa/robocasa_uv/.venv/bin/python \
+run_scripts/eval/robocasa_kitchen/robocasa_uv/.venv/bin/python \
     rldx/eval/rollout_policy.py \
         --n-episodes 50 \
         --policy-client-host 127.0.0.1 --policy-client-port 20100 \
@@ -100,41 +108,37 @@ CloseSingleDoor     CloseDrawer        CloseDoubleDoor
 ```
 
 Each one is a separate gym env id of the form
-`robocasa_panda_omron/{task}_PandaOmron_Env`. The 4-GPU launcher runs 6
-tasks per GPU sequentially and aggregates results under
-`output_final/robocasa/{CKPT_NAME}/{TASK_NAME}/`.
+`robocasa_panda_omron/{task}_PandaOmron_Env`. Each shard runs its three tasks
+one after another against a single policy server, and results land under
+`output_final/robocasa/{CKPT_NAME}/{TASK_NAME}/`
+— the runner records its settings in the checkpoint directory's `manifest.json`
+and refuses to resume a directory filled under others.
 
 ## RoboCasa 365 (larger task set)
 
-[`run_scripts/eval/robocasa_365/`](../run_scripts/eval/robocasa_365/)
-bundles a SLURM submission flow:
-
-```bash
-sbatch run_scripts/eval/robocasa_365/submit_eval_rldx_bsz128_rc365.slurm.sh
-```
-
-Config defaults live in
-`submit_eval_rldx_bsz128_rc365.config.json`.
-`task_sets.yaml` lists the task splits. After every job finishes, run
-`upload_merged_eval_to_wandb.py` to push the aggregated metrics to
-Weights & Biases.
+[`run_scripts/eval/robocasa_365/`](../run_scripts/eval/robocasa_365/) holds the
+launcher [`eval_robocasa365.sh`](../run_scripts/eval/robocasa_365/eval_robocasa365.sh)
+and `task_sets.yaml`, which lists the task splits. See the
+[RoboCasa365 README](../run_scripts/eval/robocasa_365/README.md) for setup and
+the run command.
 
 ## LIBERO (4 suites × 10 tasks)
 
 Canonical script:
-[`run_scripts/eval/libero/eval_rldx_libero.sh`](../run_scripts/eval/libero/eval_rldx_libero.sh)
+[`run_scripts/eval/libero/eval_libero.sh`](../run_scripts/eval/libero/eval_libero.sh)
 
-Setup the sim env once:
+Setup the sim env once, then run:
 
 ```bash
-bash rldx/eval/sim/LIBERO/setup_libero.sh
+bash run_scripts/eval/libero/setup_libero.sh
+
+bash run_scripts/eval/libero/eval_libero.sh <CKPT_NAME> <MODEL_PATH> [GPU_ID] [MAX_PARALLEL]
 ```
 
-LIBERO env ids look like `libero_{suite}_{task_idx}`, for example
-`libero_spatial_0`. The script array-indexes across all 40 tasks (10
-per suite × 4 suites). Same model-server + rollout split as RoboCasa,
-just with the LIBERO venv at
-`rldx/eval/sim/LIBERO/libero_uv/.venv/bin/python`.
+LIBERO env ids look like `libero_sim/<task_name>`, for example
+`libero_sim/turn_on_the_stove`. The script runs one model server on `GPU_ID`, and all 40 tasks (10 per suite × 4 suites)
+rolled out `MAX_PARALLEL` at a time from the LIBERO venv at
+`run_scripts/eval/libero/libero_uv/.venv/bin/python`.
 
 ## GR1 tabletop (humanoid)
 
@@ -144,41 +148,26 @@ just with the LIBERO venv at
 # Setup (one-time)
 bash run_scripts/eval/gr1_tabletop/setup_gr1.sh
 
-# Single task
-bash run_scripts/eval/gr1_tabletop/eval_gr1.sh my_checkpoint_path
-
-# Multi-task sweep
-bash run_scripts/eval/gr1_tabletop/eval_gr1_multi.sh my_checkpoint_path
+# All 24 tasks across 8 shards, on every visible GPU
+bash run_scripts/eval/gr1_tabletop/eval_gr1.sh RLWRLD/RLDX-1.1-FT-GR1
 ```
 
-GR1 uses robocasa-gr1-tabletop-tasks with the Unitree G1 embodiment.
-Pass `--embodiment-tag UNITREE_G1` to the server.
+Same shape as RoboCasa: 8 shards, one per card at a time, then the score. See
+the [GR1 README](../run_scripts/eval/gr1_tabletop/README.md) for the protocol
+variables.
+
+GR-1 Tabletop runs robocasa-gr1-tabletop-tasks on the GR-1 humanoid.
+The embodiment tag is `GENERAL_EMBODIMENT`, which
+`run_scripts/eval/gr1_tabletop/eval_gr1.sh` already passes to the
+server.
 
 ## Collecting results
 
 Every rollout writes per-episode `.mp4` files with either `-success` or
-`-failure` in the filename, plus a `simulation_results.csv` summary.
-Quick success-rate tally:
-
-```bash
-cd output_final/robocasa/{ckpt}/{task}
-S=$(ls *-success.mp4 2>/dev/null | wc -l)
-F=$(ls *-failure.mp4 2>/dev/null | wc -l)
-echo "$S / $((S+F)) ($((100*S/(S+F)))%)"
-```
-
-For multi-task aggregation:
-
-```bash
-for d in output_final/robocasa/{ckpt}/*/; do
-    task=$(basename "$d")
-    [ "$task" = "_launcher_logs" ] && continue
-    s=$(ls "$d"*-success.mp4 2>/dev/null | wc -l)
-    f=$(ls "$d"*-failure.mp4 2>/dev/null | wc -l)
-    total=$((s+f))
-    [ $total -gt 0 ] && printf "%-30s %2d/%2d (%3d%%)\n" "$task" "$s" "$total" "$((100*s/total))"
-done | sort
-```
+`-failure` in the filename, plus a `simulation_results.csv` per task with one
+row per episode. The RoboCasa launcher ends with the swap chain's report, which
+prints the pooled success rate once the tree holds every episode; the GR-1
+launcher ends by printing the pooled success rate over its task CSVs.
 
 ## Where to next
 

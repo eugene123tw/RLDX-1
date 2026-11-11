@@ -35,9 +35,9 @@ Install PyTorch for RTX 5090 / Blackwell support:
 
 ```bash
 uv pip install \
-  torch==2.8.0+cu129 \
-  torchvision==0.23.0+cu129 \
-  --index-url https://download.pytorch.org/whl/cu129
+  torch==2.8.0+cu128 \
+  torchvision==0.23.0+cu128 \
+  --index-url https://download.pytorch.org/whl/cu128
 ```
 
 Install torchaudio:
@@ -57,7 +57,7 @@ uv pip install \
 Expected output:
 
 ```text
-2.8.0+cu129 12.9
+2.8.0+cu128 12.8
 ```
 
 ---
@@ -137,13 +137,13 @@ $RLDX_ROOT/.venv/bin/python -c "import torch, flash_attn; print(torch.__version_
 
 Expected output should show:
 
-- `torch==2.8.0+cu129`
+- `torch==2.8.0+cu128`
 - a valid `flash_attn` import path inside the uv environment
 
 Example:
 
 ```text
-2.8.0+cu129 12.9
+2.8.0+cu128 12.8
 $RLDX_ROOT/.venv/lib/python3.10/site-packages/flash_attn/__init__.py
 ```
 
@@ -208,6 +208,21 @@ uv pip install ~/pyzed-5.0-cp310-cp310-linux_x86_64.whl
 ---
 
 ## 6. Install DROID
+
+> **Licensing note.** The `droid-dataset/droid` repository installed below
+> carries no license file: no LICENSE at the repo root, no license statement in
+> its README, no `license` key in its `pyproject.toml`, and the GitHub license
+> API returns 404 with `"license": null` (re-checked 2026-09-03).
+>
+> That hardware-control repository is the only unlicensed piece this document
+> brings in. The same organization publishes `droid-dataset/droid_policy_learning`
+> under MIT, and the DROID dataset itself under CC BY 4.0.
+>
+> This document tells you how to install and configure DROID on your own robot
+> rig, and sections 7.1 and 7.2 have you edit files inside that checkout. We
+> redistribute none of its bytes: nothing from this install is vendored into
+> this repository, and the artifacts we ship today contain none of it. Revisit
+> this note if we ever distribute a preinstalled image.
 
 Install DROID:
 

@@ -28,7 +28,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-# Mirror the main repo's baseline dependencies so install behaves the same.
+# Baseline dependencies, pinned exactly so every install resolves the same.
 dependencies = [
     "albumentations==1.4.18",
     "av==15.0.0",
@@ -43,29 +43,32 @@ dependencies = [
     "torch==2.7.0",
     "torchvision==0.22.0",
     "transformers==4.57.0",
-    "tyro==0.9.17",
-    # flash-attn is a required runtime dep on every CUDA install. CPU-only
-    # boxes that need to ``uv sync`` (lint, doc) must use
+    "tyro==1.0.16",
+    # flash-attn is a required runtime dep on every CUDA install. The
+    # ``sys_platform == 'linux'`` marker keeps it out of macOS / Windows
+    # resolution, where it cannot build and no CUDA kernel would run anyway,
+    # so those platforms need no extra ``uv sync`` flag. Linux CPU-only boxes
+    # (lint, doc, CI) are still selected by the marker and must use
     # ``uv sync --no-install-package flash-attn`` (the same flag CI uses).
     # RTX 5090 / Blackwell (sm_120) builds use the pixi environment instead
     # — see ``pixi.toml`` and ``docs/installation.md``.
-    "flash-attn==2.7.4.post1",
-    "click==8.1.8",
+    "flash-attn==2.7.4.post1 ; sys_platform == 'linux'",
+    "click==8.2.1",
     "datasets==3.6.0",
     "einops==0.8.1",
-    "gymnasium==1.2.2",
     "matplotlib==3.10.1",
     "numpy==1.26.4",
     "omegaconf==2.3.0",
+    "optree==0.20.0",
     "scipy==1.15.3",
     "torchcodec==0.4.0",
-    "wandb==0.23.0",
+    "wandb==0.30.0",
     "pyzmq==27.0.1",
-    "deepspeed==0.17.6",
+    "deepspeed==0.19.6",
     "moviepy==1.0.3",
     "opencv-contrib-python-headless==4.11.0.86",
-    # Issue #21 — previously implicit via transformers transitive install;
-    # pin explicitly so a transformers upgrade cannot silently drop them.
+    # Previously implicit via transformers' transitive install; pinned
+    # explicitly so a transformers upgrade cannot silently drop them.
     "accelerate>=0.34",
     "safetensors>=0.4.5",
     "huggingface-hub>=0.26",
@@ -74,41 +77,41 @@ dependencies = [
     "requests>=2.32",
     "PyYAML>=6.0",
     "packaging>=24.0",
-    # Imported by ``rldx.eval.serving.websocket_policy_server`` (loaded via
-    # ``run_rldx_server_pi.py``); not a transitive of anything else.
-    "websockets>=13.0",
+    # torch.compile's CPU backend imports it at run time; triton brings it only on Linux x86_64.
+    "setuptools>=67",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff",
+    "ruff==0.15.22",
     "ipython",
-    "pytest>=8.0",
-    "pytest-timeout>=2.3",
-    "hypothesis>=6.0",
-    "hypothesis-torch>=0.8",
 ]
 # Evaluation-specific clients. Not needed for ``import rldx`` or training.
 # Install with ``uv sync --extra eval``. ``lerobot`` is intentionally NOT
-# listed — lerobot 0.4.x requires ``wandb>=0.24`` and lerobot 0.5+ requires
-# Python 3.12, both of which clash with the pinned core deps. Install
-# manually after ``uv sync`` if you need the SO100 / LeRobot data path:
-# ``uv pip install --no-deps lerobot``.
+# listed — 0.3.3 is the last release that writes LeRobot v2.1, and its
+# ``gymnasium<1.0`` pin clashes with the one below. Install manually after
+# ``uv sync`` if you need the LeRobot dataset-conversion path
+# (``run_scripts/data/convert_h5_to_v2.py``):
+# ``uv pip install --no-deps lerobot==0.3.3 jsonlines h5py``.
 eval = [
+    # Only the sim harness imports it, and that runs under the simulator
+    # venvs; CI needs it because the packaging tests import those modules.
+    "gymnasium==1.2.2",
     "imageio>=2.34",
-    "draccus>=0.8",
     "transforms3d>=0.4",
-    "openpi-client>=0.1",
 ]
 tensorrt = [
     "onnx>=1.20.0",
     "tensorrt>=10.14.1.48.post1",
 ]
+nvfp4 = [
+    "flashinfer-python>=0.6.10",
+]
 
 [project.urls]
 Homepage = "https://rlwrld.ai/rldx-1"
-Repository = "https://github.com/RLWRLD/RLDX"
-Issues = "https://github.com/RLWRLD/RLDX/issues"
+Repository = "https://github.com/RLWRLD/RLDX-1"
+Issues = "https://github.com/RLWRLD/RLDX-1/issues"
 
 [tool.setuptools.dynamic]
 version = {attr = "rldx.__version__"}
@@ -116,22 +119,23 @@ version = {attr = "rldx.__version__"}
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["rldx*"]
+# ``namespaces`` defaults to true, so without this the __init__-less
+# directories under rldx/eval/sim/ are packaged along with the harness.
+exclude = ["rldx.eval.sim*"]
 
 [tool.uv.extra-build-dependencies]
 flash-attn = ["torch==2.7.0", "numpy==1.26.4"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-markers = [
-    "gpu: requires CUDA GPU (skipped in CPU-only CI)",
-    "slow: long-running tests (skipped in quick sweeps)",
-    "integration: multi-process / multi-venv end-to-end test",
-    "hf_internal: depends on private HF repos (env-gated: RLDX_INTERNAL_HF=1)",
-]
-filterwarnings = [
-    "ignore::DeprecationWarning:pkg_resources",
-]
+# ``tensorrt-cu13-libs`` (from the ``tensorrt`` extra) ships only an sdist
+# whose build backend downloads a wheel matching the *host* platform tag. uv
+# resolves universally, so it needs that metadata even where no such wheel
+# exists — which made ``uv lock`` impossible to run from a Mac at all. The
+# package is a payload of CUDA shared objects with no runtime dependencies
+# (confirmed against the resolved entry in uv.lock), so declaring that lets
+# uv skip the build. Linux resolution is unchanged.
+[[tool.uv.dependency-metadata]]
+name = "tensorrt-cu13-libs"
+requires-dist = []
 
 [tool.ruff]
 line-length = 100
@@ -165,12 +169,6 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
-# Triton kernels follow upstream tutorial / FlashAttention paper naming
-# (``O`` for output buffer, ``l`` for log-sum-exp accumulator) and the
-# ``grid = lambda meta: (...)`` form is the documented Triton API for
-# launch-grid specs.  Suppress the style rules that fight those
-# conventions inside the inference Triton kernels.
-"rldx/inference/**/kernels/*.py" = ["E741", "E731"]
 
 [tool.ruff.lint.isort]
 case-sensitive = false

@@ -16,6 +16,11 @@
 # This file has been modified from the original NVIDIA Isaac GR00T N1.7.
 # Original source: https://github.com/NVIDIA/Isaac-GR00T
 
+import copy
+import importlib.util
+import json
+from pathlib import Path
+
 from rldx.data.embodiment_tags import EmbodimentTag
 from rldx.data.types import (
     ActionConfig,
@@ -226,98 +231,6 @@ MODALITY_CONFIGS = {
             modality_keys=["annotation.human.action.task_description"],
         ),
     },
-    "behavior_r1_pro": {
-        "video": ModalityConfig(
-            delta_indices=[0],
-            modality_keys=[
-                "observation.images.rgb.head_256_256",
-                "observation.images.rgb.left_wrist_256_256",
-                "observation.images.rgb.right_wrist_256_256",
-            ],
-        ),
-        "state": ModalityConfig(
-            delta_indices=[0],
-            modality_keys=[
-                "robot_pos",  # 3
-                "robot_ori_cos",  # 3
-                "robot_ori_sin",  # 3
-                "robot_2d_ori",  # 1
-                "robot_2d_ori_cos",  # 1
-                "robot_2d_ori_sin",  # 1
-                "robot_lin_vel",  # 3
-                "robot_ang_vel",  # 3
-                "arm_left_qpos",  # 7
-                "arm_left_qpos_sin",  # 7
-                "arm_left_qpos_cos",  # 7
-                "eef_left_pos",  # 3
-                "eef_left_quat",  # 4
-                "gripper_left_qpos",  # 2
-                "arm_right_qpos",  # 7
-                "arm_right_qpos_sin",  # 7
-                "arm_right_qpos_cos",  # 7
-                "eef_right_pos",  # 3
-                "eef_right_quat",  # 4
-                "gripper_right_qpos",  # 2
-                "trunk_qpos",  # 4
-            ],
-        ),  # dim = 82
-        "action": ModalityConfig(
-            delta_indices=list(range(0, 32)),
-            modality_keys=[
-                "base",
-                "torso",
-                "left_arm",
-                "left_gripper",
-                "right_arm",
-                "right_gripper",
-            ],
-            action_configs=[
-                # base
-                ActionConfig(
-                    rep=ActionRepresentation.ABSOLUTE,
-                    type=ActionType.NON_EEF,
-                    format=ActionFormat.DEFAULT,
-                ),
-                # torso
-                ActionConfig(
-                    rep=ActionRepresentation.RELATIVE,
-                    type=ActionType.NON_EEF,
-                    format=ActionFormat.DEFAULT,
-                    state_key="trunk_qpos",
-                ),
-                # left_arm
-                ActionConfig(
-                    rep=ActionRepresentation.RELATIVE,
-                    type=ActionType.NON_EEF,
-                    format=ActionFormat.DEFAULT,
-                    state_key="arm_left_qpos",
-                ),
-                # left_gripper
-                ActionConfig(
-                    rep=ActionRepresentation.ABSOLUTE,
-                    type=ActionType.NON_EEF,
-                    format=ActionFormat.DEFAULT,
-                ),
-                # right_arm
-                ActionConfig(
-                    rep=ActionRepresentation.RELATIVE,
-                    type=ActionType.NON_EEF,
-                    format=ActionFormat.DEFAULT,
-                    state_key="arm_right_qpos",
-                ),
-                # right_gripper
-                ActionConfig(
-                    rep=ActionRepresentation.ABSOLUTE,
-                    type=ActionType.NON_EEF,
-                    format=ActionFormat.DEFAULT,
-                ),
-            ],
-        ),
-        "language": ModalityConfig(
-            delta_indices=[0],
-            modality_keys=["annotation.human.coarse_action"],
-        ),
-    },
 }
 
 
@@ -328,3 +241,42 @@ def register_modality_config(
         f"Embodiment tag {embodiment_tag} already registered"
     )
     MODALITY_CONFIGS[embodiment_tag.value] = config
+
+
+_LOADED_FILES: dict[Path, dict[str, dict[str, ModalityConfig]]] = {}
+
+
+def load_modality_config_file(path: str | Path) -> dict[str, dict[str, ModalityConfig]]:
+    """Run a ``.py`` modality config and return the tags it registered; a file runs once."""
+    path = Path(path).resolve()
+    if path in _LOADED_FILES:
+        return _LOADED_FILES[path]
+    if not path.is_file():
+        raise FileNotFoundError(f"Modality config path does not exist: {path}")
+    if path.suffix != ".py":
+        raise ValueError(f"Unsupported modality config format: {path.suffix}. Use .py")
+    before = copy.deepcopy(MODALITY_CONFIGS)
+    spec = importlib.util.spec_from_file_location(f"_modality_config_{path.stem}", path)
+    spec.loader.exec_module(importlib.util.module_from_spec(spec))
+    _LOADED_FILES[path] = {
+        tag: configs for tag, configs in MODALITY_CONFIGS.items() if before.get(tag) != configs
+    }
+    return _LOADED_FILES[path]
+
+
+def modality_configs_for(
+    embodiment_tag: EmbodimentTag, path: str | Path | None = None
+) -> dict[str, ModalityConfig]:
+    """One embodiment's configs: from a ``.json`` of ModalityConfig fields, a ``.py``, or the registry."""
+    if path is not None and Path(path).suffix == ".json":
+        fields = json.loads(Path(path).read_text())
+        return {modality: ModalityConfig(**value) for modality, value in fields.items()}
+    if path is not None:
+        load_modality_config_file(path)
+    if embodiment_tag.value not in MODALITY_CONFIGS:
+        raise ValueError(
+            f"No modality config for embodiment tag '{embodiment_tag.name}' "
+            f"(value='{embodiment_tag.value}'). Available tags: {sorted(MODALITY_CONFIGS)}. "
+            "Pass --modality-config-path (.py or .json)."
+        )
+    return MODALITY_CONFIGS[embodiment_tag.value]

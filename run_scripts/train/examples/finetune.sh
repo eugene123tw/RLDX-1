@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name="Finetune RLDX-1 on custom dataset"
+#SBATCH --job-name="Finetune RLDX-1.1 on custom dataset"
 #SBATCH --nodes=1
 #SBATCH --gpus=8
 #SBATCH --output=slurm_out/%j-rldx1_ft_custom.out
@@ -15,7 +15,7 @@ set -euo pipefail
 export WANDB_PROJECT="${WANDB_PROJECT:-rldx-finetune}"
 export NO_ALBUMENTATIONS_UPDATE=1
 
-BASE_MODEL_PATH="${BASE_MODEL_PATH:-RLWRLD/RLDX-1-PT}"
+BASE_MODEL_PATH="${BASE_MODEL_PATH:-RLWRLD/RLDX-1.1-PT}"
 CKPT_NAME="rldx1_ft_custom"
 RUN_NAME="$CKPT_NAME"
 
@@ -29,13 +29,12 @@ ARGS=(
     --n-cog-tokens 64
     --video-length 4
 
-    # Dataset (uncomment the multi-dataset line to mix datasets instead;
-    # --dataset-paths takes precedence over --dataset-path at runtime)
-    --dataset-path "/path/to/your/lerobot_dataset"
-    # --dataset-paths "/path/a" "/path/b" --dataset-mix-ratios 1.0 0.5
+    # Dataset (list several paths to mix them, with optional per-path weights:
+    # --data.paths "/path/a" "/path/b" --data.mix-ratios 1.0 0.5)
+    data:paths --data.paths "/path/to/your/lerobot_dataset"
+    --data.embodiment-tag "$EMBODIMENT_TAG"
 
     --dataloader-num-workers 8
-    --embodiment-tag "$EMBODIMENT_TAG"
     --modality-config-path "$MODALITY_CONFIG_PATH"
     --base-model-path "$BASE_MODEL_PATH"
     --output-dir "$CKPT_DIR"
@@ -48,20 +47,31 @@ ARGS=(
     # Add-ons (uncomment any to enable)
 
     # Motion: discrete action-prefix tokens injected mid-backbone.
-    # --use-motion --motion-insert-layer 9
+    # motion:on --motion.insert-layer 9
 
     # Memory: cross-clip context tokens for long-horizon manipulation.
-    # --use-memory --memory-length 4 --memory-stride 16 --memory-n-cog-tokens 16 --concat-memory
+    # memory:on --memory.length 4 --memory.stride 16 --memory.n-cog-tokens 16 --memory.concat
 
     # Physics: per-step force/torque head; match keys/dims to your schema.
-    # --use-physics --physics-keys torque --physics-dims 48 --allow-missing-physics
+    # physics:on --physics.keys torque --physics.dims 48 --physics.allow-missing
 
-    --use-wandb
-    --wandb-project "$WANDB_PROJECT"
+    # Smoke test only: build the architecture but skip the checkpoint read.
+    # Needs a fresh --output-dir (see docs/training.md).
+    # --skip-weight-loading
+
+    wandb:on
+    --wandb.project "$WANDB_PROJECT"
     --experiment-name "$RUN_NAME"
 )
 
 cd "$BASE_DIR"
 export MASTER_PORT=$(shuf -i 20000-30000 -n 1)
+# jemalloc keeps DataLoader worker RSS from ratcheting up over long runs.
+JEMALLOC_PATH="${JEMALLOC_PATH:-/usr/lib/x86_64-linux-gnu/libjemalloc.so.2}"
+if [ -r "$JEMALLOC_PATH" ]; then
+    export LD_PRELOAD="$JEMALLOC_PATH${LD_PRELOAD:+:$LD_PRELOAD}"
+else
+    echo "[!] jemalloc not found: $JEMALLOC_PATH; continuing with glibc malloc (apt install libjemalloc2, or set JEMALLOC_PATH)" >&2
+fi
 uv run torchrun --nproc_per_node=$NUM_GPUS --master_port=$MASTER_PORT \
     rldx/experiment/launch_train.py "${ARGS[@]}"

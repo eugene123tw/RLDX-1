@@ -70,8 +70,7 @@ class STSSTransformation(nn.Module):
 
         return corr
 
-    def forward(self, x, grid_sizes):
-        t, h, w = grid_sizes[0]
+    def forward(self, x, t, h, w):
         if self.window[0] > 1:
             x = rearrange(x, "(b t h w) c -> b t c h w", t=t, h=h, w=w)
             x_src = repeat(x, "b t c h w -> (b t l) c h w", l=self.window[0])
@@ -101,6 +100,40 @@ class STSSTransformation(nn.Module):
         return stss
 
 
+class FP32BatchNorm3d(nn.BatchNorm3d):
+    _fp32_stats = ("running_mean", "running_var")
+
+    def __init__(self, num_features):
+        super().__init__(num_features)
+        for name in self._fp32_stats:
+            setattr(self, name, getattr(self, name).float())
+
+    def _apply(self, fn, recurse=True):
+        stats = {name: getattr(self, name) for name in self._fp32_stats}
+        super()._apply(fn, recurse=recurse)
+        for name, fp32 in stats.items():
+            applied = getattr(self, name)
+            if applied.dtype != torch.float32:
+                setattr(self, name, fp32.to(applied.device))
+        return self
+
+    def forward(self, x):
+        self._check_input_dim(x)
+        if self.training:
+            self.num_batches_tracked.add_(1)
+        y = F.batch_norm(
+            x.float(),
+            self.running_mean,
+            self.running_var,
+            self.weight.float(),
+            self.bias.float(),
+            self.training,
+            self.momentum,
+            self.eps,
+        )
+        return y.to(x.dtype)
+
+
 class STSSExtraction(nn.Module):
     def __init__(self, window=(5, 9, 9), chnls=(256,), use_layernorm=False, use_syncbn=False):
         super().__init__()
@@ -112,7 +145,7 @@ class STSSExtraction(nn.Module):
         elif use_syncbn:
             norm_layer = nn.SyncBatchNorm(chnls[0])
         else:
-            norm_layer = nn.BatchNorm3d(chnls[0])
+            norm_layer = FP32BatchNorm3d(chnls[0])
 
         self.conv0 = nn.Sequential(
             nn.Conv3d(
@@ -135,88 +168,16 @@ class STSSExtraction(nn.Module):
 
 
 class STSSIntegration(nn.Module):
-    def __init__(
-        self,
-        d_in,
-        window=(5, 9, 9),
-        chnls=(64, 64, 64),
-        use_layernorm=False,
-        use_syncbn=False,
-        mode="lite",
-    ):
+    def __init__(self, d_in, window=(5, 9, 9), chnls=(64, 64, 64)):
         super().__init__()
-        self.window = window
-        self.mode = mode
-
-        if mode == "lite":
-            # Single 1x1 Conv3d: L fuse + channel projection, no spatial mixing, no norm.
-            # Replaces the 3-layer 3x3 conv stack so motion module contributes from step 1
-            # (no residual-layer-scale warm-up).
-            self.fuse = nn.Sequential(
-                Rearrange("(b l) c t h w -> b (l c) t h w", l=self.window[0]),
-                nn.Conv3d(d_in * self.window[0], chnls[-1], kernel_size=(1, 1, 1), bias=False),
-                nn.GELU(),
-            )
-            return
-
-        if use_layernorm:
-            norm_layer0 = nn.GroupNorm(1, chnls[0])
-            norm_layer1 = nn.GroupNorm(1, chnls[1])
-            norm_layer2 = nn.GroupNorm(1, chnls[2])
-        elif use_syncbn:
-            norm_layer0 = nn.SyncBatchNorm(chnls[0])
-            norm_layer1 = nn.SyncBatchNorm(chnls[1])
-            norm_layer2 = nn.SyncBatchNorm(chnls[2])
-        else:
-            norm_layer0 = nn.BatchNorm3d(chnls[0])
-            norm_layer1 = nn.BatchNorm3d(chnls[1])
-            norm_layer2 = nn.BatchNorm3d(chnls[2])
-
-        self.conv0 = nn.Sequential(
-            nn.Conv3d(
-                d_in,
-                chnls[0],
-                kernel_size=(1, 3, 3),
-                stride=(1, 1, 1),
-                padding=(0, 1, 1),
-                bias=False,
-            ),
-            norm_layer0,
-            nn.GELU(),
-        )
-        self.conv1 = nn.Sequential(
-            nn.Conv3d(
-                chnls[0],
-                chnls[1],
-                kernel_size=(1, 3, 3),
-                stride=(1, 1, 1),
-                padding=(0, 1, 1),
-                bias=False,
-            ),
-            norm_layer1,
-            nn.GELU(),
-        )
-        self.conv2_fuse = nn.Sequential(
-            Rearrange("(b l) c t h w -> b (l c) t h w", l=self.window[0]),
-            nn.Conv3d(
-                chnls[1] * self.window[0],
-                chnls[2],
-                kernel_size=(1, 3, 3),
-                stride=(1, 1, 1),
-                padding=(0, 1, 1),
-                bias=False,
-            ),
-            norm_layer2,
+        self.fuse = nn.Sequential(
+            Rearrange("(b l) c t h w -> b (l c) t h w", l=window[0]),
+            nn.Conv3d(d_in * window[0], chnls[-1], kernel_size=(1, 1, 1), bias=False),
             nn.GELU(),
         )
 
     def forward(self, x):
-        if self.mode == "lite":
-            return self.fuse(x)
-        x = self.conv0(x)
-        x = self.conv1(x)
-        x = self.conv2_fuse(x)
-        return x
+        return self.fuse(x)
 
 
 class STSSEncoder(nn.Module):
@@ -231,7 +192,6 @@ class STSSEncoder(nn.Module):
         corr_func="cosine",
         use_layernorm=False,
         use_syncbn=False,
-        int_mode="lite",
     ):
         super().__init__()
         self.window = window
@@ -241,20 +201,12 @@ class STSSEncoder(nn.Module):
         self.stss_extraction = STSSExtraction(
             window=window, chnls=ext_chnls, use_layernorm=use_layernorm, use_syncbn=use_syncbn
         )
-        self.stss_integration = STSSIntegration(
-            ext_chnls[-1],
-            window=window,
-            chnls=int_chnls,
-            use_layernorm=use_layernorm,
-            use_syncbn=use_syncbn,
-            mode=int_mode,
-        )
+        self.stss_integration = STSSIntegration(ext_chnls[-1], window=window, chnls=int_chnls)
         self.out_proj = nn.Linear(int_chnls[-1], d_out)
 
-    def forward(self, x, grid_sizes):
-        t, h, w = grid_sizes[0]
+    def forward(self, x, t, h, w):
         x = self.in_proj(self.ln_pre(x))
-        x = self.stss_transformation(x, grid_sizes)
+        x = self.stss_transformation(x, t, h, w)
         x = self.stss_extraction(x)
         x = self.stss_integration(x)
         x = self.out_proj(rearrange(x, "b c t h w -> (b t h w) c"))
@@ -277,7 +229,6 @@ class MotionModule(nn.Module):
         use_layernorm=False,
         use_syncbn=False,
         gradient_check=False,
-        int_mode="lite",
     ):
         super().__init__()
         self.use_layerscale = use_layerscale
@@ -296,7 +247,6 @@ class MotionModule(nn.Module):
                     corr_func=corr_func,
                     use_layernorm=use_layernorm,
                     use_syncbn=use_syncbn,
-                    int_mode=int_mode,
                 )
                 for i in range(n_encoders)
             ]
@@ -362,32 +312,13 @@ class MotionModule(nn.Module):
         # started as a no-op — dropped so motion module contributes from step 1 instead of
         # warming up behind a residual shortcut.
 
-    def forward(self, x, grid_sizes):
-        # x: (total_tokens, C) where total_tokens = sum(t_i * h_i * w_i)
-        # grid_sizes: (batch_size, 3) where each row is [t, h, w]
-        all_same_grid = (grid_sizes == grid_sizes[0]).all()
-
-        if all_same_grid:
-            out = x
-            encoder_outputs = []
-            for stss_encoder in self.stss_encoders:
-                out = stss_encoder(out, grid_sizes=grid_sizes)
-                encoder_outputs.append(out)
-            out = torch.stack(encoder_outputs, dim=0).sum(dim=0)
-        else:
-            num_tokens_per_video = grid_sizes.prod(dim=1).tolist()
-            x_splits = x.split(num_tokens_per_video, dim=0)
-
-            processed_videos = []
-            for x_video, grid_size in zip(x_splits, grid_sizes):
-                video_out = x_video
-                encoder_outputs = []
-                for stss_encoder in self.stss_encoders:
-                    video_out = stss_encoder(video_out, grid_sizes=grid_size.unsqueeze(0))
-                    encoder_outputs.append(video_out)
-                video_out = torch.stack(encoder_outputs, dim=0).sum(dim=0)
-                processed_videos.append(video_out)
-            out = torch.cat(processed_videos, dim=0)
+    def forward(self, x, t, h, w):
+        out = x
+        encoder_outputs = []
+        for stss_encoder in self.stss_encoders:
+            out = stss_encoder(out, t, h, w)
+            encoder_outputs.append(out)
+        out = torch.stack(encoder_outputs, dim=0).sum(dim=0)
 
         if self.use_layerscale:
             out = out * self.layerscale

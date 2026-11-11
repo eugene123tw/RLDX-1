@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from rldx.dist import rank_zero_print as _print
 from rldx.experiment.features.context import AssemblyContext
-from rldx.utils.dist import rank_zero_print as _print
 
 
 class MossFeature:
@@ -12,25 +12,14 @@ class MossFeature:
 
     @staticmethod
     def is_active(cli) -> bool:
-        return cli.use_motion
+        return cli.motion is not None
 
     @staticmethod
     def apply(ctx: AssemblyContext) -> None:
-        cli = ctx.cli
-        model = ctx.model
-
-        model.use_motion = True
-        model.motion_insert_layer = cli.motion_insert_layer
-        model.motion_injection_point = cli.motion_injection_point
-        model.motion_pool_type = cli.motion_pool_type
-        model.motion_drop = cli.motion_drop
-        model.motion_gradient_check = cli.motion_gradient_check
+        motion = ctx.cli.motion.to_config(ctx.model.motion)
+        ctx.model.motion = motion
         _print(
-            f"[i] use_motion: True, motion_insert_layer: {cli.motion_insert_layer}, "
-            f"motion_injection_point: {cli.motion_injection_point}, "
-            f"motion_pool_type: {cli.motion_pool_type}, motion_drop: {cli.motion_drop}"
+            f"[i] motion: insert_layer {motion.insert_layer}, "
+            f"injection_point {motion.injection_point}, pool_type {motion.pool_type}, "
+            f"drop {motion.drop}"
         )
-
-    @staticmethod
-    def required_state_dict_prefixes() -> frozenset[str]:
-        return frozenset()

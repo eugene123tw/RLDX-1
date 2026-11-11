@@ -1,26 +1,28 @@
-import os
-import re
-import csv
-import time
-import tqdm
-import tyro
-import enum
-import signal
+from collections import defaultdict, deque
 import contextlib
+import csv
 import dataclasses
 import datetime
+import enum
 import faulthandler
+import os
+import re
+import signal
+import time
+
+from droid.robot_env import RobotEnv
+from moviepy.editor import ImageSequenceClip
 import numpy as np
 import pandas as pd
-from collections import defaultdict, deque
-from moviepy.editor import ImageSequenceClip
 from PIL import Image as PILImage
-
-import torch
-from droid.robot_env import RobotEnv
-
-from rldx.policy.rldx_policy import RLDXPolicy
+from rldx.configs.model.inference import InferenceConfig
 from rldx.data.embodiment_tags import EmbodimentTag
+from rldx.serving.policy import RLDXMemoryPolicy, RLDXPolicy, load_policy
+from rldx.serving.server import require_cadence
+import torch
+import tqdm
+import tyro
+
 
 faulthandler.enable()
 DROID_CONTROL_FREQUENCY = 10
@@ -32,7 +34,7 @@ class EnvMode(enum.Enum):
 
 
 @dataclasses.dataclass
-class Checkpoint:
+class PolicyDir:
     config: str
     dir: str
     seed: int = 7
@@ -49,8 +51,8 @@ class Args:
 
     default_prompt: str | None = None
 
-    policy: Checkpoint = dataclasses.field(
-        default_factory=lambda: Checkpoint(
+    policy: PolicyDir = dataclasses.field(
+        default_factory=lambda: PolicyDir(
             config="rldx",
             dir="/YOUR_CHECKPOINT_HERE",
         )
@@ -84,15 +86,13 @@ class Args:
     wowskin_port_left: str = "/dev/ttyACM1"
 
 
-def create_policy(args: Args) -> RLDXPolicy:
-    policy = RLDXPolicy(
+def load_deploy_policy(args: Args) -> RLDXPolicy | RLDXMemoryPolicy:
+    return load_policy(
         embodiment_tag=args.embodiment_tag,
         model_path=args.policy.dir,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        deactivate_memory=args.deactivate_memory,
-        require_physics=True,
+        inference_config=InferenceConfig(deactivate_memory=args.deactivate_memory),
     )
-    return policy
 
 
 def get_success_rate() -> float:
@@ -153,7 +153,9 @@ def build_observation(
             "video":    {model_key: np.ndarray(B, T, H, W, C), dtype=uint8},
             "state":    {model_key: np.ndarray(B, T, D),       dtype=float32},
             "language": {key: [[instruction]]},
-            "physics":  {sub_key: np.ndarray(B, T, D), dtype=float32},  # optional
+            # physics groups exactly as get_modality_config advertises:
+            "tactile":  {sub_key: np.ndarray(B, T, D), dtype=float32},
+            "torque":   {sub_key: np.ndarray(B, T, D), dtype=float32},
         }
     """
     # --- video ---
@@ -202,15 +204,16 @@ def build_observation(
 
     obs = {"video": video, "state": state, "language": language}
 
-    # --- physics ---
+    # --- physics: one top-level group per key, as the handshake advertises ---
     if physics_queues and physics_num_frames > 0:
-        physics = {}
         for sub_key, q in physics_queues.items():
+            group, sub = sub_key.split(".", 1)
             q_list = list(q)
             # Take last physics_num_frames entries (stride=1, contiguous history)
             selected = q_list[-physics_num_frames:]
-            physics[sub_key] = np.stack(selected)[None].astype(np.float32)  # (1, T, D)
-        obs["physics"] = physics
+            obs.setdefault(group, {})[sub] = np.stack(selected)[None].astype(
+                np.float32
+            )  # (1, T, D)
 
     return obs
 
@@ -235,13 +238,14 @@ def main(args: Args):
     env = RobotEnv(action_space=env_action_space, gripper_action_space=env_gripper_action_space)
     print(f"Created the RLDX DROID env! (action_space={env_action_space}, gripper={env_gripper_action_space})")
 
-    policy = create_policy(args)
+    policy = load_deploy_policy(args)
+    require_cadence(policy.get_rtc(), policy.get_memory(), args.open_loop_horizon)
     modality_cfg = policy.get_modality_config()
 
     # --- Auto-detect video T and language key ---
     video_T = len(modality_cfg["video"].delta_indices)
     args.num_frames = video_T
-    args.language_key = policy.language_key
+    args.language_key = modality_cfg["language"].modality_keys[0]
 
     # --- Video key mapping: model keys -> camera sources ---
     video_model_keys = modality_cfg["video"].modality_keys
@@ -325,7 +329,6 @@ def main(args: Args):
     print("Loaded RLDX policy model!")
     print(f"  Checkpoint : {args.policy.dir}")
     print(f"  Embodiment : {args.embodiment_tag}")
-    print(f"  Memory     : {policy.use_memory}")
     print(f"  Video T    : {video_T} frame(s) per inference")
     print(f"  Language   : {args.language_key}")
     print(f"  State space: {args.state_space} (keys: {list(state_keys_map.keys())})")
@@ -379,10 +382,9 @@ def main(args: Args):
         concatenated_action = None
         action_chunk_idx = 0
         episode_id = num_trials
-
-        # Memory state management: unique session per episode, reset on first inference
-        session_id = f"real_robot_{os.getpid()}_{num_trials}"
-        is_first_inference = True
+        # One memory session per trial; its first inference starts the episode.
+        session = {"session_ids": [f"real_robot_{os.getpid()}_{num_trials}"]}
+        starts_episode = True
 
         video_log = []
         bar = tqdm.tqdm(range(args.max_timesteps))
@@ -493,16 +495,13 @@ def main(args: Args):
                     with prevent_keyboard_interrupt():
                         infer_start = time.time()
                         # action: {key: np.ndarray(B=1, T, D)}
-                        # Always send session/reset signal — feature independence.
-                        # Server routes by enabled features (memory, RTC, ...);
-                        # gating on any single feature here drops reset propagation
-                        # for the others.
-                        options = {
-                            "reset_memory": [is_first_inference],
-                            "session_ids": [session_id],
-                        }
-                        action_dict, _ = policy.get_action(observation, options=options)
-                        is_first_inference = False
+                        options = (
+                            {**session, "reset_memory": [starts_episode]}
+                            if policy.get_memory() is not None
+                            else {}
+                        )
+                        action_dict, _ = policy.get_action(observation, options)
+                        starts_episode = False
                         infer_end = time.time()
 
                     # Concatenate all action keys along last dim: (T, total_action_dim)
