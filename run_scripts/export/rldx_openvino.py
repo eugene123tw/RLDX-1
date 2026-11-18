@@ -554,6 +554,7 @@ def cmd_parity(args: argparse.Namespace) -> int:
         gc.collect()
         torch.cuda.empty_cache()
     if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2))
     return 0 if ok else 1
 
@@ -661,6 +662,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         f"(model {result['model_median_ms']:.1f} ms), repeats {[round(m, 1) for m in medians]}"
     )
     if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(result, indent=2))
     return 0
 

@@ -237,6 +237,8 @@ cd ~/git/RLDX-1; S=run_scripts/export/rldx_openvino.py; F=/tmp/rldx11_fixtures/r
 .venv/bin/python $S export --model-path RLWRLD/RLDX-1.1-FT-ROBOCASA \
     --hidden-alignment 64 --output exports/rldx11_robocasa_ov_a64
 .venv/bin/python $S quantize --export-dir exports/rldx11_robocasa_ov_a64 \
+    --output exports/rldx11_robocasa_ov_a64_int8 --mode int8_sym
+.venv/bin/python $S quantize --export-dir exports/rldx11_robocasa_ov_a64 \
     --output exports/rldx11_robocasa_ov_a64_int8asym --mode int8_asym
 # fp32 CPU reference is cached; torch candidates calibrate the bar
 .venv/bin/python $S parity --export-dir exports/rldx11_robocasa_ov_a64 --fixtures $F \
