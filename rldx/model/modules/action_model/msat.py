@@ -25,7 +25,7 @@ from rldx.model.modules.action_model.blocks import (
 )
 from rldx.model.modules.action_model.ops import RoPEEmbedder1D, TimestepEncoder
 from rldx.model.modules.action_model.padded_swiglu import PaddedSwiGLUFFN
-from rldx.model.modules.norms import adaptive_layer_norm
+from rldx.model.modules.norms import RMSNorm, adaptive_layer_norm
 from rldx.model.quantization.sites import LinearSite
 
 
@@ -42,6 +42,18 @@ class MSATOutput(NamedTuple):
 
 class JointBase(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
+    # Factor the state-action residual stream is divided by; see MSAT.rescale_residual_stream.
+    # 1.0 (the default) leaves training and checkpoint inference untouched.
+    residual_scale = 1.0
+
+    def _into_residual_stream(self, x):
+        """Scale a tensor that enters the SA residual stream from outside the blocks.
+
+        ``rescale_residual_stream`` only rescales the in-block writers, so the stream's entry
+        points (state-action embeddings, time token, projected VL tokens) are divided here to
+        keep the whole stream on the same scale. A no-op when ``residual_scale`` is 1.
+        """
+        return x if self.residual_scale == 1.0 else x * (1.0 / self.residual_scale)
 
     def _forward_inner(
         self,
@@ -67,7 +79,7 @@ class JointBase(ModelMixin, ConfigMixin):
         has_time_token = False
         if self.temb_type == "input_token":
             # 1. Projection: (B, D) -> (B, 1, D)
-            t_emb = self.time_token_proj(temb).unsqueeze(1)
+            t_emb = self._into_residual_stream(self.time_token_proj(temb)).unsqueeze(1)
 
             # 2. Replication: (B, 1, D) -> (B, N, D)
             time_token = t_emb.repeat(1, self.num_temb_tokens, 1)
@@ -97,7 +109,7 @@ class JointBase(ModelMixin, ConfigMixin):
                 f"MSAT built with use_physics={self.use_physics} cannot take "
                 f"physics_embs={'a tensor' if physics_embs is not None else None}"
             )
-        sa, vl = sa_embs.contiguous(), vl_embs.contiguous()
+        sa, vl = self._into_residual_stream(sa_embs.contiguous()), vl_embs.contiguous()
         p = None if physics_embs is None else physics_embs.contiguous()
         n_p = 0 if p is None else p.shape[1]
 
@@ -145,7 +157,7 @@ class JointBase(ModelMixin, ConfigMixin):
         # Upper: SingleStreamBlocks [VL' | time | S | A (| P)]
         if len(self.single_blocks) > 0:
             n_vl = vl.shape[1]
-            vl_projected = self.vl_proj_to_sa(vl)
+            vl_projected = self._into_residual_stream(self.vl_proj_to_sa(vl))
             if has_time_token:
                 x = torch.cat([vl_projected, time_token, sa], dim=1)
             else:
@@ -191,13 +203,17 @@ class JointBase(ModelMixin, ConfigMixin):
         """RoPE ids over [VL | time | body | P]: VL on axis 0 (rope_vl_sa only), time and body
         on axis 1 with the body starting at ``first``, P on axis 1 with axis 0 set to 1."""
         ids = torch.zeros(batch, n_vl + n_time + n_body + n_p, 2, dtype=torch.long, device=device)
-        if self.positional_embeddings == "rope_vl_sa":
+        # Skip empty slices: exporters (OpenVINO) cannot constant-fold zero-element writes.
+        if self.positional_embeddings == "rope_vl_sa" and n_vl:
             ids[:, :n_vl, 0] = torch.arange(n_vl, device=device)
         body = n_vl + n_time
-        ids[:, n_vl:body, 1] = torch.arange(n_time, device=device)
-        ids[:, body : body + n_body, 1] = torch.arange(first, first + n_body, device=device)
-        ids[:, body + n_body :, 0] = 1
-        ids[:, body + n_body :, 1] = torch.arange(n_p, device=device)
+        if n_time:
+            ids[:, n_vl:body, 1] = torch.arange(n_time, device=device)
+        if n_body:
+            ids[:, body : body + n_body, 1] = torch.arange(first, first + n_body, device=device)
+        if n_p:
+            ids[:, body + n_body :, 0] = 1
+            ids[:, body + n_body :, 1] = torch.arange(n_p, device=device)
         return ids
 
     @staticmethod
@@ -262,6 +278,63 @@ class MSAT(JointBase):
             for name in ("linear1", "linear2", "mlp_proj"):
                 if getattr(block, name) is not None:
                     yield LinearSite("msat_sa", block, name)
+
+    def residual_stream(self) -> tuple[list[nn.Linear], list[nn.Module]]:
+        """In-block writers and reader norms of the state-action residual stream.
+
+        Writers are the linears whose (gated) outputs are added to the stream: the attention
+        out-projection ``sa_proj`` and FFN down-projection ``sa_mlp.w3`` of double blocks, and
+        ``linear2`` of single blocks. Readers are every norm that consumes the stream: the
+        pre-attention/pre-FFN norms of double blocks, ``pre_norm`` of single blocks and the
+        final ``norm_out``.
+
+        Rescaling is only exact when every reader is a LayerNorm/RMSNorm (scale invariant up
+        to ``eps``) and no post-norm re-normalizes a writer's output (which would undo the
+        rescale), so any other configuration, and physics tokens, raise ``ValueError``.
+        """
+        double, single = list(self.double_blocks), list(self.single_blocks)
+        # Post-norms sit between a writer and the residual add; they must be Identity.
+        post = [m for b in double for m in (b.sa_norm2_attn, b.sa_norm3_mlp)]
+        post += [b.post_norm for b in single]
+        readers = [m for b in double for m in (b.sa_norm1, b.sa_norm2_mlp)]
+        readers += [b.pre_norm for b in single] + [self.norm_out]
+        # PaddedSwiGLUFFN guarantees ``sa_mlp.w3`` exists and is the FFN output projection.
+        if (
+            self.use_physics
+            or not all(isinstance(m, nn.Identity) for m in post)
+            or not all(isinstance(m, (nn.LayerNorm, RMSNorm)) for m in readers)
+            or not all(isinstance(b.sa_mlp, PaddedSwiGLUFFN) for b in double)
+        ):
+            raise ValueError("MSAT residual stream has a reader that is not scale invariant")
+        writers = [m for b in double for m in (b.sa_proj, b.sa_mlp.w3)]
+        writers += [b.linear2 for b in single]
+        return writers, readers
+
+    @torch.no_grad()
+    def rescale_residual_stream(self, scale: float) -> None:
+        """Divide the state-action residual stream by ``scale`` without changing the outputs.
+
+        Every writer is divided by ``scale`` and every reader norm's eps by ``scale**2``, so
+        normalized reads are unchanged while activation peaks drop by ``scale`` (e.g. to fit
+        float16). A power of two keeps the rescaled weights exact.
+
+        Motivation: on OpenVINO GPU float16 the SA residual stream peaks around 9e4, above the
+        float16 max of 65504, and overflows to inf. Dividing by 16 brings it to ~6e3.
+
+        The change is in place and meant for export only: ``return_all_hidden_states`` then
+        returns the stream divided by ``scale``. Calls compose (``residual_scale`` multiplies).
+        """
+        writers, readers = self.residual_stream()
+        for linear in writers:
+            # Gates and adaLN modulations are linear in the writer output, so they need no change.
+            linear.weight.div_(scale)
+            if linear.bias is not None:
+                linear.bias.div_(scale)
+        for norm in readers:
+            # norm(x / s) with eps / s**2 == norm(x) with eps, for LayerNorm and RMSNorm alike.
+            norm.eps /= scale * scale
+        # Picked up by _into_residual_stream for the tensors entering the stream.
+        self.residual_scale *= scale
 
     @register_to_config
     def __init__(

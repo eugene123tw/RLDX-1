@@ -200,7 +200,9 @@ def _sdpa_attend(query, key, value, layout, scale):
     positions = torch.arange(batch * length, device=query.device)
     segment = (layout.cu_seqlens <= positions[:, None]).sum(-1).view(batch, 1, length)
     causal = torch.ones(length, length, dtype=torch.bool, device=query.device).tril()
-    mask = (segment.mT == segment).unsqueeze(1) & causal
+    # Same-segment causal mask: token i attends to j iff both are in one sequence and j <= i.
+    # transpose, not .mT: OpenVINO has no aten::mT conversion rule.
+    mask = (segment.transpose(-1, -2) == segment).unsqueeze(1) & causal
     attended = F.scaled_dot_product_attention(
         query, key, value, attn_mask=mask, scale=scale, enable_gqa=True
     )

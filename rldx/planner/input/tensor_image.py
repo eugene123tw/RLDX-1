@@ -59,22 +59,22 @@ class TensorImageSpec:
         patch = self.patch_size
         temporal = self.temporal_patch_size
         merge = self.merge_size
-        grid_h, grid_w = height // patch, width // patch
-        patches = normalized[:, None].expand(-1, temporal, -1, -1, -1)
-        patches = patches.reshape(
-            count,
-            1,
-            temporal,
-            grid_h // merge,
-            merge,
-            patch,
-            grid_w // merge,
-            merge,
-            patch,
-            channels,
+        rows, cols = height // (patch * merge), width // (patch * merge)
+        # Split merge windows, then patches, keeping tensors at rank <= 8 (OpenVINO GPU limit).
+        # Output order matches the previous single rank-10 permute and the HF Qwen3-VL processor:
+        # windows row-major, then (merge_h, merge_w) patches, each flattened as (C, T, ph, pw).
+        # (count, H, W, C) -> (count, rows, merge*ph, cols, merge*pw*C)
+        windows = normalized.reshape(count, rows, merge * patch, cols, merge * patch * channels)
+        # -> (count*rows*cols, merge_h, ph, merge_w, pw, C)
+        windows = windows.permute(0, 1, 3, 2, 4).reshape(
+            count * rows * cols, merge, patch, merge, patch, channels
         )
-        patches = patches.permute(0, 1, 3, 6, 4, 7, 9, 2, 5, 8)
-        return patches.reshape(count * grid_h * grid_w, channels * temporal * patch * patch)
+        # -> (n_patches, C, 1, ph, pw), then repeat the still image over the temporal patch.
+        patches = windows.permute(0, 1, 3, 5, 2, 4).reshape(-1, channels, 1, patch, patch)
+        patches = patches.expand(-1, -1, temporal, -1, -1)
+        return patches.reshape(
+            count * rows * cols * merge * merge, channels * temporal * patch * patch
+        )
 
     def pixel_values(
         self,

@@ -434,7 +434,8 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         # Dynamic RoPE resets must use the original FP32 values on the current
         # device too. Neither derived frequency table belongs in checkpoints.
-        self.register_buffer("original_inv_freq", inv_freq, persistent=False)
+        # Own storage: two buffers aliasing one tensor trip up graph tracers (OpenVINO export).
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
 
         self.mrope_section = config.rope_scaling.get("mrope_section", [24, 20, 20])
 
@@ -1313,7 +1314,12 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         if (
             attention_mask_is_canonical
             and attention_mask is not None
-            and self.config._attn_implementation == "flash_attention_2"
+            and (
+                self.config._attn_implementation == "flash_attention_2"
+                # Planned text layers attend through ``text_attention``, never this mask, so
+                # skip create_causal_mask: its transformers vmap mask path is not traceable.
+                or kwargs.get("text_attention") is not None
+            )
         ):
             attention_mask = _prepare_canonical_fa2_mask(
                 attention_mask, inputs_embeds, cache_position, past_key_values

@@ -24,32 +24,23 @@ class STSSTransformation(nn.Module):
         Args:
             corr_g: (b, h, w, h, w) global correlation tensor
         Returns:
-            (b, h, w, window, window) local correlation tensor
+            (b, h, w, window, window) local correlation tensor:
+            ``out[b, i, j, u, v] = corr_g[b, i, j, i + u - d, j + v - d]`` (``pad_value`` outside),
+            gathered with plain indexing so graph exporters without ``aten::diagonal`` trace it.
         """
         max_d = self.window[1] // 2
-
-        corr_l = [
-            F.pad(
-                torch.diagonal(corr_g, offset=i, dim1=1, dim2=3),
-                (abs(i) if i < 0 else 0, abs(i) if i >= 0 else 0),
-                value=self.pad_value,
-            )
-            for i in range(-max_d, max_d + 1)
+        _, h, w = corr_g.shape[:3]
+        padded = F.pad(corr_g, (max_d, max_d, max_d, max_d), value=self.pad_value)
+        offsets = torch.arange(2 * max_d + 1, device=corr_g.device)
+        rows = torch.arange(h, device=corr_g.device)[:, None] + offsets  # (h, U)
+        cols = torch.arange(w, device=corr_g.device)[:, None] + offsets  # (w, V)
+        return padded[
+            :,
+            torch.arange(h, device=corr_g.device)[:, None, None, None],
+            torch.arange(w, device=corr_g.device)[None, :, None, None],
+            rows[:, None, :, None],
+            cols[None, :, None, :],
         ]
-        corr_l = torch.stack(corr_l, dim=-1)  # B, W1, W2, H1, H2 -> U
-
-        corr_l = [
-            F.pad(
-                torch.diagonal(corr_l, offset=i, dim1=1, dim2=2),
-                (abs(i) if i < 0 else 0, abs(i) if i >= 0 else 0),
-                value=self.pad_value,
-            )
-            for i in range(-max_d, max_d + 1)
-        ]
-        corr_l = torch.stack(corr_l, dim=-1)  # B, H1, H2 -> U, W1, W2 -> V
-        corr_l = corr_l.transpose(2, 3).contiguous()  # B, H1, W1, U, V
-
-        return corr_l
 
     def _correlation(self, feat1, feat2):
         if self.corr_func == "cosine":
