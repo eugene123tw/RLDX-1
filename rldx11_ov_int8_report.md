@@ -44,8 +44,8 @@ S=run_scripts/export/rldx_openvino.py
 # 4. Parity fixtures: record real observations from a torch server while a LIBERO eval drives it
 #    (every 10th request, up to 64), then compare
 .venv/bin/python $S serve --model-path RLWRLD/RLDX-1.1-FT-LIBERO-IMG --runtime-profile eager \
-    --record-dir /tmp/rldx11_fixtures/libero --port 20000
-.venv/bin/python $S parity --export-dir <dir> --fixtures /tmp/rldx11_fixtures/libero \
+    --record-dir fixtures/libero --port 20000
+.venv/bin/python $S parity --export-dir <dir> --fixtures fixtures/libero \
     --ov-devices GPU.0 --ref-device cpu --ref-dtype fp32
 # 5. Closed loop (upstream eval_libero.sh untouched; batch-1 export -> N_ENVS=1)
 N_EPISODES=10 bash run_scripts/export/eval_libero_openvino.sh rldx11_ov_int8 \
@@ -182,9 +182,11 @@ next-largest activations are in text layers 14 and 16, at 12.3k. No NaN or inf a
 
 **Fixtures.** 33 real observations recorded from the torch `eager` server, one episode each on
 `PnPCounterToCab`, `OpenDrawer`, `TurnOnSinkFaucet`, `CoffeePressButton`, `OpenDoubleDoor` and
-`TurnOnStove` (5 of 6 succeeded). They are in `/tmp/rldx11_fixtures/robocasa`. They were recorded by
-running `rldx_openvino.py serve --runtime-profile eager --record-dir /tmp/rldx11_fixtures/robocasa`
-(saves every 10th request) while `rollout_policy.py` drove it. Only `parity` uses them.
+`TurnOnStove` (5 of 6 succeeded). They are in `RLDX-1/fixtures/robocasa` (75 MB, untracked; the LIBERO
+ones are in `fixtures/libero`). They were recorded by running
+`rldx_openvino.py serve --runtime-profile eager --record-dir fixtures/robocasa` (saves every 10th
+request) while `rollout_policy.py` drove it; there is no separate recording script. Only `parity` uses
+them. To check parity on another machine, copy `fixtures/` there instead of re-recording.
 
 **Thresholds.** These come from what upstream itself ships, measured against the same torch fp32 CPU
 reference with shared noise:
@@ -233,7 +235,7 @@ Choice for the RoboCasa runs: **f16** (`exports/rldx11_robocasa_ov_a64`) and **I
 quantized IR within upstream's fp8 drift.
 
 ```bash
-cd ~/git/RLDX-1; S=run_scripts/export/rldx_openvino.py; F=/tmp/rldx11_fixtures/robocasa
+cd ~/git/RLDX-1; S=run_scripts/export/rldx_openvino.py; F=fixtures/robocasa
 .venv/bin/python $S export --model-path RLWRLD/RLDX-1.1-FT-ROBOCASA \
     --hidden-alignment 64 --output exports/rldx11_robocasa_ov_a64
 .venv/bin/python $S quantize --export-dir exports/rldx11_robocasa_ov_a64 \
@@ -242,7 +244,7 @@ cd ~/git/RLDX-1; S=run_scripts/export/rldx_openvino.py; F=/tmp/rldx11_fixtures/r
     --output exports/rldx11_robocasa_ov_a64_int8asym --mode int8_asym
 # fp32 CPU reference is cached; torch candidates calibrate the bar
 .venv/bin/python $S parity --export-dir exports/rldx11_robocasa_ov_a64 --fixtures $F \
-    --ref-device cpu --ref-dtype fp32 --ref-cache /tmp/rldx11_robocasa_ref_fp32.npz \
+    --ref-device cpu --ref-dtype fp32 --ref-cache fixtures/rldx11_robocasa_ref_fp32.npz \
     --torch-candidates cuda:bf16 cuda:bf16:any:fp8 --ov-devices CPU GPU.0
 # Latency: run once per IR (f16, int8, int8asym)
 for d in rldx11_robocasa_ov_a64 rldx11_robocasa_ov_a64_int8 rldx11_robocasa_ov_a64_int8asym; do
