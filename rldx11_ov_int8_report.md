@@ -33,18 +33,21 @@ our 5e-2 bar, but mean error and cosine are small, and the closed loop shows no 
 cd ~/git/RLDX-1
 S=run_scripts/export/rldx_openvino.py
 # 1. Export (f16-safe action head, SwiGLU/vision-MLP widths padded to 64)
-.venv/bin/python $S export --model-path RLWRLD/RLDX-1.1-FT-LIBERO-IMG \
-    --observation /tmp/rldx11_fixtures/libero/000000 --hidden-alignment 64 \
+.venv/bin/python $S export --model-path RLWRLD/RLDX-1.1-FT-LIBERO-IMG --hidden-alignment 64 \
     --output /tmp/rldx11_libero_img_ov_a64
 # 2. INT8 weight compression (data-free, per-channel symmetric)
 .venv/bin/python $S quantize --export-dir /tmp/rldx11_libero_img_ov_a64 \
     --output /tmp/rldx11_libero_img_ov_a64_int8 --mode int8_sym
-# 3. Latency / parity
+# 3. Latency (blank observation; shapes are static, so input content does not change timing)
 .venv/bin/python $S bench  --backend openvino --export-dir <dir> --ov-device GPU.0 --ov-precision f16 \
-    --observation /tmp/rldx11_fixtures/libero/000000 --iters 50
+    --iters 50
+# 4. Parity fixtures: record real observations from a torch server while a LIBERO eval drives it
+#    (every 10th request, up to 64), then compare
+.venv/bin/python $S serve --model-path RLWRLD/RLDX-1.1-FT-LIBERO-IMG --runtime-profile eager \
+    --record-dir /tmp/rldx11_fixtures/libero --port 20000
 .venv/bin/python $S parity --export-dir <dir> --fixtures /tmp/rldx11_fixtures/libero \
     --ov-devices GPU.0 --ref-device cpu --ref-dtype fp32
-# 4. Closed loop (upstream eval_libero.sh untouched; batch-1 export -> N_ENVS=1)
+# 5. Closed loop (upstream eval_libero.sh untouched; batch-1 export -> N_ENVS=1)
 N_EPISODES=10 bash run_scripts/export/eval_libero_openvino.sh rldx11_ov_int8 \
     /tmp/rldx11_libero_img_ov_a64_int8 GPU.0
 ```
@@ -75,8 +78,10 @@ N_EPISODES=10 bash run_scripts/export/eval_libero_openvino.sh rldx11_ov_int8 \
 
 ## Latency
 
-Median `get_action` time per call: batch 1, one recorded LIBERO observation, 2 × 50 calls after 10
-warm-up calls. "Model" is time inside the OV infer request.
+Median `get_action` time per call: batch 1, 2 × 50 calls after 10 warm-up calls. "Model" is time
+inside the OV infer request. The input is a blank observation: the graph has static shapes and a fixed
+number of denoising steps, so timing does not depend on the input content (a recorded observation and
+a blank one both give 38.5 ms on the padded INT8 IR).
 
 | Variant (B70, f16 inference precision) | get_action (ms) | model (ms) |
 |---|---|---|
@@ -177,7 +182,9 @@ next-largest activations are in text layers 14 and 16, at 12.3k. No NaN or inf a
 
 **Fixtures.** 33 real observations recorded from the torch `eager` server, one episode each on
 `PnPCounterToCab`, `OpenDrawer`, `TurnOnSinkFaucet`, `CoffeePressButton`, `OpenDoubleDoor` and
-`TurnOnStove` (5 of 6 succeeded). They are in `/tmp/rldx11_fixtures/robocasa`.
+`TurnOnStove` (5 of 6 succeeded). They are in `/tmp/rldx11_fixtures/robocasa`. They were recorded by
+running `rldx_openvino.py serve --runtime-profile eager --record-dir /tmp/rldx11_fixtures/robocasa`
+(saves every 10th request) while `rollout_policy.py` drove it. Only `parity` uses them.
 
 **Thresholds.** These come from what upstream itself ships, measured against the same torch fp32 CPU
 reference with shared noise:
@@ -209,8 +216,9 @@ helps. The error is spread across the model, with the text backbone contributing
 per-channel weights fix it without keeping anything in f16, and land inside the `any:fp8` drift on all
 three metrics. They still miss the 5e-2 absolute bar.
 
-Latency on the B70, `get_action` median, batch 1, real RoboCasa observation (`000000`, `PnPCounterToCab`),
-2 × 50 calls after 10 warm-up calls, OV inference precision f16. The same command measures every IR;
+Latency on the B70, `get_action` median, batch 1, 2 × 50 calls after 10 warm-up calls, OV inference
+precision f16. The table was measured on a recorded observation; a blank one gives the same timing
+(INT8 asym: 89.1 vs 89.6 ms), so `bench` needs no fixture. The same command measures every IR;
 quantized IRs carry their compression mode in `rldx_openvino.json`. Reports are in
 `RLDX-1/results/ov_bench/robocasa_bench_<ir>.json`.
 
@@ -226,7 +234,7 @@ quantized IR within upstream's fp8 drift.
 
 ```bash
 cd ~/git/RLDX-1; S=run_scripts/export/rldx_openvino.py; F=/tmp/rldx11_fixtures/robocasa
-.venv/bin/python $S export --model-path RLWRLD/RLDX-1.1-FT-ROBOCASA --observation $F/000000 \
+.venv/bin/python $S export --model-path RLWRLD/RLDX-1.1-FT-ROBOCASA \
     --hidden-alignment 64 --output exports/rldx11_robocasa_ov_a64
 .venv/bin/python $S quantize --export-dir exports/rldx11_robocasa_ov_a64 \
     --output exports/rldx11_robocasa_ov_a64_int8asym --mode int8_asym
@@ -237,10 +245,96 @@ cd ~/git/RLDX-1; S=run_scripts/export/rldx_openvino.py; F=/tmp/rldx11_fixtures/r
 # Latency: run once per IR (f16, int8, int8asym)
 for d in rldx11_robocasa_ov_a64 rldx11_robocasa_ov_a64_int8 rldx11_robocasa_ov_a64_int8asym; do
   .venv/bin/python $S bench --backend openvino --export-dir exports/$d --ov-device GPU.0 \
-      --ov-precision f16 --observation $F/000000 --iters 50 \
+      --ov-precision f16 --iters 50 \
       --report results/ov_bench/robocasa_bench_$d.json
 done
 ```
+
+## RoboCasa success rate (OV on the B70)
+
+**Where upstream's Thor numbers come from.** In `docs/optimization.md`, the success-rate column is RoboCasa
+kitchen, scored by `run_scripts/eval/robocasa_kitchen/eval_robocasa.sh` (the launcher `docs/evaluation.md`
+names). The footnote gives the conditions: 24 tasks × 5 scene layouts × 10 episodes, seeds 42 to 46, at
+most 720 steps (1,000 for `OpenDoubleDoor`), served on Thor, mean of 2 runs. That launcher starts
+`rldx/eval/run_rldx_server.py` without `--runtime-profile`, so it always measures `compile`. The
+`any:fp8` and nvfp4 rows needed the server started with `--runtime-profile <preset>`, and the repo does
+not contain that variant. The launcher also runs 5 environments per process and needs CUDA; it cannot
+serve an OV export.
+
+**OV runner.** `run_scripts/export/eval_robocasa_openvino.sh` is the RoboCasa counterpart of
+`eval_libero_openvino.sh`. Upstream `eval_robocasa.sh` is untouched. The OV runner:
+- starts one `rldx_openvino.py serve --backend openvino` server on the export, then runs
+  `rldx/eval/rollout_policy.py` from the RoboCasa venv;
+- reads the 24 task names from upstream `eval_robocasa.sh` and uses its protocol: seed 42, 16 actions
+  per call, 720 / 1000 steps, 5-lane seed layout;
+- runs each lane at batch 1 (`--n_envs 1 --env_layout 5 --env_idx_offset 0..4`), which matches the
+  batch-1 export. This is the mode upstream's swap chain re-runs with, so it selects the same 1,200
+  scenes, and it cannot hit the camera-view swap. No swap chain is needed;
+- runs up to `MAX_PARALLEL` tasks at once against the one server, with a task's 5 lanes in turn because
+  they share a results CSV;
+- writes `manifest.json` and refuses to resume a directory made with another export, device,
+  precision or protocol;
+- prints `[progress]` lines while running and a per-task table at the end (`summary.csv`), counted
+  from the episode videos as upstream does.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `N_EPISODES` | 50 | Episodes per task, a multiple of 5 (one fifth per lane) |
+| `TASKS` | all 24 | Comma-separated task subset |
+| `TASK_LIMIT` | all | Keep the first n tasks of the list |
+| `OV_PRECISION` | device default (f16 on GPU) | OV inference precision hint |
+| `MAX_PARALLEL` (4th argument) | 4 | Tasks in flight against the one server |
+
+**Setup on a fresh machine.** The script does not install anything. It checks the prerequisites
+first and stops with the missing step:
+
+1. **Repo:** a checkout of the branch with `run_scripts/export/` and the export patches
+   (`dev-1.1` on the `eugene` fork), not upstream `v1.1.0`.
+2. **Model venv:** `uv sync --python 3.10`, then
+   `uv pip install --python .venv/bin/python openvino==2026.4.1 nncf==3.4.0`. openvino and nncf are
+   not in the lockfile, so every later `uv sync` or `uv run` removes them; reinstall them afterwards.
+3. **Intel GPU:** the compute runtime is installed, and
+   `.venv/bin/python -c "import openvino as ov; print(ov.Core().available_devices)"` lists the device.
+4. **Simulator:** `INSTALL_FLASH_ATTN=0 bash run_scripts/eval/robocasa_kitchen/setup_robocasa.sh`.
+   It initializes the submodule, builds the venv with robosuite 1.5.1 and downloads about 5 GB of
+   kitchen assets.
+5. **Exports:** run `export` without `--observation`, then `quantize --mode int8_asym`; the commands
+   are in the script header. This needs only the CPU, about 30 GB of RAM and about 25 min, and it
+   downloads the checkpoint. No CUDA or recorded observations are needed: a blank observation gives
+   the same input layout as a recorded RoboCasa one (checked against the existing export). Recorded
+   fixtures are needed only for `parity`. Copying an existing export directory also works.
+
+Disk needed: about 40 GB (checkpoint 13 GB, f16 IR 12 GB, INT8 IR 5.7 GB, assets and venv about 10 GB).
+
+Partial runs are a prefix of the full run. Episode seeds are `(42 + lane) × 100000 + episode`, so
+`N_EPISODES=10` runs episodes 0 and 1 of every lane. Running the same `RUN_NAME` again with a larger
+`N_EPISODES` resumes and adds only the missing episodes.
+
+```bash
+cd ~/git/RLDX-1
+R=run_scripts/export/eval_robocasa_openvino.sh
+# Quick check: 2 tasks x 5 episodes (1 per lane), about 6 min on the B70
+N_EPISODES=5 TASKS=OpenDrawer,TurnOnStove bash $R rldx11_ov_int8asym_smoke \
+    exports/rldx11_robocasa_ov_a64_int8asym GPU.0 2
+# Small scale: all 24 tasks x 10 episodes (240 episodes), roughly 1 to 1.5 h at MAX_PARALLEL=4
+N_EPISODES=10 bash $R rldx11_ov_int8asym exports/rldx11_robocasa_ov_a64_int8asym GPU.0
+# Full protocol (24 x 50 = 1,200 episodes); resumes the 10-episode run above
+N_EPISODES=50 bash $R rldx11_ov_int8asym exports/rldx11_robocasa_ov_a64_int8asym GPU.0
+# Same for f16
+N_EPISODES=50 bash $R rldx11_ov_f16 exports/rldx11_robocasa_ov_a64 GPU.0
+```
+
+Outputs go to `output_final/robocasa/<RUN_NAME>/`: per-task videos, `simulation_results.csv`,
+`eval.log`, plus `server.log`, `manifest.json` and `summary.csv` at the top.
+
+The quick check ran end to end with the INT8 asym export: `OpenDrawer` 5/5, `TurnOnStove` 3/5, 8/10
+pooled, no server errors. Lanes 0 to 4 produced `env00` to `env04`, as upstream's layout does. Ten
+episodes are too few to compare with the 72.3 % upstream reports for this checkpoint.
+
+For a torch baseline on the 3090, use the upstream launcher unchanged:
+`N_GPUS=1 bash run_scripts/eval/robocasa_kitchen/eval_robocasa.sh RLWRLD/RLDX-1.1-FT-ROBOCASA` (`compile`, 5
+environments per process, then its swap chain). `N_EPISODES` and `TASK_LIMIT` work the same way for
+smoke runs.
 
 ## Artifacts
 
@@ -248,6 +342,7 @@ done
 |---|---|
 | `RLDX-1/run_scripts/export/rldx_openvino.py` | `export` (`--hidden-alignment`), `quantize` (NNCF), `parity`, `bench`, `serve`, `--ov-config KEY=VALUE` |
 | `RLDX-1/run_scripts/export/eval_libero_openvino.sh` | Closed-loop LIBERO with the OV server; `N_ENVS`, `[progress]` lines |
+| `RLDX-1/run_scripts/export/eval_robocasa_openvino.sh` | Closed-loop RoboCasa with the OV server; full or partial (`N_EPISODES`, `TASKS`, `TASK_LIMIT`) |
 | `RLDX-1/results/ov_bench/*.json` | Bench and parity reports |
 | `/tmp/rldx11_libero_img_ov_a64`, `/tmp/rldx11_libero_img_ov_a64_int8` | f16 and INT8 IRs (in `/tmp`; move them out to keep them) |
 | `/tmp/ov_profile.py` | Per-layer GPU profile script (`PERF_COUNT`) |
@@ -283,10 +378,8 @@ frames, 24 kitchen tasks × 50 episodes, success 73.1 % `compile` / 71.4 % `any:
       data-aware NNCF pass) if closed loop shows a gap to f16.
 - [ ] Latency, same checkpoint and input as the upstream table: `bench` on the RTX 3090 (`eager`,
       `compile`, `any:bf16`, `--limits-batch 3`) and on the B70 (OV f16, INT8).
-- [ ] OV closed-loop runner `run_scripts/export/eval_robocasa_openvino.sh` (upstream `eval_robocasa.sh`
-      untouched). Keep the protocol (seed 42, 5-lane seed layout, 16 actions per call, 720 / 1000 steps)
-      but run each lane at batch 1 (`--n_envs 1 --env_layout 5 --env_idx_offset 0..4`), the mode the
-      upstream swap chain already uses; that selects the same 1,200 scenes.
+- [x] OV closed-loop runner `run_scripts/export/eval_robocasa_openvino.sh` (upstream `eval_robocasa.sh`
+      untouched): same protocol, each lane at batch 1. Quick check passed (2 tasks × 5 episodes).
 - [ ] Torch baseline on the RTX 3090 with upstream `eval_robocasa.sh` (`N_GPUS=1`), then OV f16 and
       INT8 on the B70. Smoke with `N_EPISODES=10` first (must be a multiple of 5).
 
