@@ -226,14 +226,39 @@ observation. The same command measures every IR; quantized IRs carry their compr
 `rldx_openvino.json`. Reports are in `RLDX-1/results/ov_bench/robocasa_bench_<ir>.json` (same file
 names on both machines).
 
-| IR | B70 get_action (ms) | B70 model (ms) | B390 get_action (ms) | B390 model (ms) | size |
-|---|---|---|---|---|---|
-| f16 | 107.3 | 105.7 | 395.1 | 393.6 | 12 GB |
-| INT8 `int8_sym` | 86.7 (-19 %) | 85.2 | 279.0 (-29 %) | 277.5 | 5.7 GB |
-| **INT8 `int8_asym`** | **89.6 (-16 %)** | **88.1** | **290.7 (-26 %)** | **289.2** | 5.7 GB |
+The `benchmark_app` column is OpenVINO's `benchmark_app` on the B70, with the Python host code left out:
+median of 100 iterations, `-hint latency -nireq 1`, f16 inference precision, fed the real inputs of
+RoboCasa fixture `000000`. Logs and JSON reports are in `RLDX-1/results/ov_bench/benchmark_app/<ir>/`.
+
+| IR | B70 get_action (ms) | B70 model (ms) | B70 `benchmark_app` (ms) | B390 get_action (ms) | B390 model (ms) | size |
+|---|---|---|---|---|---|---|
+| f16 | 107.3 | 105.7 | 104.5 | 395.1 | 393.6 | 12 GB |
+| INT8 `int8_sym` | 86.7 (-19 %) | 85.2 | 83.6 (-20 %) | 279.0 (-29 %) | 277.5 | 5.7 GB |
+| **INT8 `int8_asym`** | **89.6 (-16 %)** | **88.1** | **86.3 (-17 %)** | **290.7 (-26 %)** | **289.2** | 5.7 GB |
 
 The B390 is about 3.3 to 3.7 times slower than the B70. It shares system memory bandwidth, and the
 model is bandwidth-bound, so INT8 weights save more there than on the B70.
+
+The `benchmark_app` median is 1 to 2 ms below the `bench` model time, which also counts copying inputs
+and outputs through the Python API. Its spread is under ±1 ms (min / max: f16 103.5 / 105.2, sym
+83.0 / 84.1, asym 86.0 / 86.9). It also reports first inference (137, 140, 157 ms) and B70 compile
+time (26.3, 15.6, 15.9 s). Notes for repeating it:
+- Do not let `benchmark_app` fill inputs with random data. Random values in `input_ids`,
+  `position_ids` and `vision_layout` index out of range. Dump one real feed to `.npy` files with
+  `physical-ai-studio/tmp_scripts/dump_ov_bench_inputs.py <export> <fixture> <out_dir>`, which prints the
+  `-i` mapping on its last line.
+- Pass `-iop position_ids:i64`. `benchmark_app` takes the 3-D `position_ids` for an image and expects u8.
+- Ignore the reported FPS. It counts the 12 camera frames as a batch of 12.
+
+```bash
+MAP=$(.venv/bin/python ../physical-ai-studio/tmp_scripts/dump_ov_bench_inputs.py \
+    exports/rldx11_robocasa_ov_a64 fixtures/robocasa/000000 results/ov_bench/inputs | tail -1)
+for d in rldx11_robocasa_ov_a64 rldx11_robocasa_ov_a64_int8 rldx11_robocasa_ov_a64_int8asym; do
+  .venv/bin/benchmark_app -m exports/$d/rldx.xml -d GPU.0 -infer_precision f16 -hint latency \
+      -nireq 1 -niter 100 -i "$MAP" -iop position_ids:i64 \
+      -report_type no_counters -json_stats -report_folder results/ov_bench/benchmark_app/$d
+done
+```
 
 Choice for the RoboCasa runs: **f16** (`exports/rldx11_robocasa_ov_a64`) and **INT8 asym**
 (`exports/rldx11_robocasa_ov_a64_int8asym`). Asym costs about 3 ms over sym and is the only fully
