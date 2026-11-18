@@ -218,17 +218,22 @@ helps. The error is spread across the model, with the text backbone contributing
 per-channel weights fix it without keeping anything in f16, and land inside the `any:fp8` drift on all
 three metrics. They still miss the 5e-2 absolute bar.
 
-Latency on the B70, `get_action` median, batch 1, 2 × 50 calls after 10 warm-up calls, OV inference
-precision f16. The table was measured on a recorded observation; a blank one gives the same timing
-(INT8 asym: 89.1 vs 89.6 ms), so `bench` needs no fixture. The same command measures every IR;
-quantized IRs carry their compression mode in `rldx_openvino.json`. Reports are in
-`RLDX-1/results/ov_bench/robocasa_bench_<ir>.json`.
+Latency, `get_action` median, batch 1, 2 × 50 calls after 10 warm-up calls, OV inference precision
+f16, on the Arc Pro B70 (discrete) and the Arc B390 (integrated GPU of a Core Ultra X7 358H, 30 GB
+shared RAM, NUC). The B70 column was measured on a recorded observation; a blank one gives the same
+timing (INT8 asym: 89.1 vs 89.6 ms), so `bench` needs no fixture. The B390 column used a blank
+observation. The same command measures every IR; quantized IRs carry their compression mode in
+`rldx_openvino.json`. Reports are in `RLDX-1/results/ov_bench/robocasa_bench_<ir>.json` (same file
+names on both machines).
 
-| IR | get_action (ms) | model (ms) | size |
-|---|---|---|---|
-| f16 | 107.3 | 105.7 | 12 GB |
-| INT8 `int8_sym` | 86.7 | 85.2 | 5.7 GB |
-| **INT8 `int8_asym`** | **89.6** | **88.1** | 5.7 GB |
+| IR | B70 get_action (ms) | B70 model (ms) | B390 get_action (ms) | B390 model (ms) | size |
+|---|---|---|---|---|---|
+| f16 | 107.3 | 105.7 | 395.1 | 393.6 | 12 GB |
+| INT8 `int8_sym` | 86.7 (-19 %) | 85.2 | 279.0 (-29 %) | 277.5 | 5.7 GB |
+| **INT8 `int8_asym`** | **89.6 (-16 %)** | **88.1** | **290.7 (-26 %)** | **289.2** | 5.7 GB |
+
+The B390 is about 3.3 to 3.7 times slower than the B70. It shares system memory bandwidth, and the
+model is bandwidth-bound, so INT8 weights save more there than on the B70.
 
 Choice for the RoboCasa runs: **f16** (`exports/rldx11_robocasa_ov_a64`) and **INT8 asym**
 (`exports/rldx11_robocasa_ov_a64_int8asym`). Asym costs about 3 ms over sym and is the only fully
