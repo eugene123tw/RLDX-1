@@ -259,6 +259,64 @@ for d in rldx11_robocasa_ov_a64 rldx11_robocasa_ov_a64_int8 rldx11_robocasa_ov_a
 done
 ```
 
+## Running latency and parity on a new machine
+
+These steps were checked on a fresh clone of `dev-1.1` without flash-attn. On the B70, `bench` gave
+89.0 ms for INT8 asym and `parity` reproduced the numbers above (max 6.64e-2, mean 9.2e-4, cos 0.99919).
+
+Requirements: Linux x86_64 with `git` and [`uv`](https://docs.astral.sh/uv/), an Intel GPU with its
+compute runtime (driver) installed, and a user that can open `/dev/dri/renderD*` (usually the `render`
+group). No CUDA is needed. Disk: venv 6.5 GB, checkpoint 13 GB, and 12 GB (f16) or 5.7 GB (INT8) per IR.
+
+```bash
+# 1. Code: the fork's dev-1.1 branch (upstream v1.1.0 lacks run_scripts/export and the export patches)
+git clone -b dev-1.1 git@github.com:eugene123tw/RLDX-1.git ~/git/RLDX-1
+cd ~/git/RLDX-1
+
+# 2. Model venv. flash-attn needs CUDA to build and the export script runs PyTorch SDPA, so skip it
+uv sync --python 3.10 --no-install-package flash-attn
+# openvino/nncf are not in uv.lock: reinstall them after every later `uv sync` or `uv run`
+uv pip install --python .venv/bin/python openvino==2026.4.1 nncf==3.4.0
+
+# 3. The Intel GPU must be listed (e.g. ['CPU', 'GPU.0']); use its name for --ov-device below
+.venv/bin/python -c "import openvino as ov; print(ov.Core().available_devices)"
+
+# 4. Checkpoint (public, 13 GB, into ~/.cache/huggingface). bench and parity need it even for
+#    OpenVINO runs: config, processor and normalization stats are read from it
+.venv/bin/hf download RLWRLD/RLDX-1.1-FT-ROBOCASA
+
+# 5. Exports: copy them from a machine that has them ...
+rsync -a <host>:~/git/RLDX-1/exports/ exports/
+#    ... or build them here (CPU only, about 30 GB RAM, about 25 min for the f16 export)
+S=run_scripts/export/rldx_openvino.py
+.venv/bin/python $S export --model-path RLWRLD/RLDX-1.1-FT-ROBOCASA \
+    --hidden-alignment 64 --output exports/rldx11_robocasa_ov_a64
+.venv/bin/python $S quantize --export-dir exports/rldx11_robocasa_ov_a64 \
+    --output exports/rldx11_robocasa_ov_a64_int8 --mode int8_sym
+.venv/bin/python $S quantize --export-dir exports/rldx11_robocasa_ov_a64 \
+    --output exports/rldx11_robocasa_ov_a64_int8asym --mode int8_asym
+
+# 6. Parity fixtures and fp32 reference cache (76 MB); recording them needs CUDA and the simulator
+rsync -a <host>:~/git/RLDX-1/fixtures/ fixtures/
+
+# 7. Latency (no fixtures needed)
+mkdir -p results/ov_bench
+for d in rldx11_robocasa_ov_a64 rldx11_robocasa_ov_a64_int8 rldx11_robocasa_ov_a64_int8asym; do
+  .venv/bin/python $S bench --backend openvino --export-dir exports/$d --ov-device GPU.0 \
+      --ov-precision f16 --iters 50 --report results/ov_bench/robocasa_bench_$d.json
+done
+
+# 8. Parity against the cached fp32 reference; INT8 exits 1 because it misses the 5e-2 bar
+for d in rldx11_robocasa_ov_a64 rldx11_robocasa_ov_a64_int8asym; do
+  .venv/bin/python $S parity --export-dir exports/$d --fixtures fixtures/robocasa \
+      --ref-device cpu --ref-dtype fp32 --ref-cache fixtures/rldx11_robocasa_ref_fp32.npz \
+      --ov-devices GPU.0 --report results/ov_bench/robocasa_parity_$d.json
+done
+```
+
+Compare the parity output with the table above. `--torch-candidates` is left out because it needs CUDA;
+its calibration rows (torch bf16 and `any:fp8`) are already in the table.
+
 ## RoboCasa success rate (OV on the B70)
 
 **Where upstream's Thor numbers come from.** In `docs/optimization.md`, the success-rate column is RoboCasa
@@ -297,17 +355,13 @@ serve an OV export.
 **Setup on a fresh machine.** The script does not install anything. It checks the prerequisites
 first and stops with the missing step:
 
-1. **Repo:** a checkout of the branch with `run_scripts/export/` and the export patches
-   (`dev-1.1` on the `eugene` fork), not upstream `v1.1.0`.
-2. **Model venv:** `uv sync --python 3.10`, then
-   `uv pip install --python .venv/bin/python openvino==2026.4.1 nncf==3.4.0`. openvino and nncf are
-   not in the lockfile, so every later `uv sync` or `uv run` removes them; reinstall them afterwards.
-3. **Intel GPU:** the compute runtime is installed, and
-   `.venv/bin/python -c "import openvino as ov; print(ov.Core().available_devices)"` lists the device.
-4. **Simulator:** `INSTALL_FLASH_ATTN=0 bash run_scripts/eval/robocasa_kitchen/setup_robocasa.sh`.
+1. **Repo, model venv, Intel GPU:** steps 1 to 3 of
+   [Running latency and parity on a new machine](#running-latency-and-parity-on-a-new-machine).
+   On a machine with CUDA, plain `uv sync --python 3.10` also works and installs flash-attn.
+2. **Simulator:** `INSTALL_FLASH_ATTN=0 bash run_scripts/eval/robocasa_kitchen/setup_robocasa.sh`.
    It initializes the submodule, builds the venv with robosuite 1.5.1 and downloads about 5 GB of
    kitchen assets.
-5. **Exports:** run `export` without `--observation`, then `quantize --mode int8_asym`; the commands
+3. **Exports:** run `export` without `--observation`, then `quantize --mode int8_asym`; the commands
    are in the script header. This needs only the CPU, about 30 GB of RAM and about 25 min, and it
    downloads the checkpoint. No CUDA or recorded observations are needed: a blank observation gives
    the same input layout as a recorded RoboCasa one (checked against the existing export). Recorded
