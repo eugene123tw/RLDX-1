@@ -419,6 +419,80 @@ The quick check ran end to end with the INT8 asym export: `OpenDrawer` 5/5, `Tur
 pooled, no server errors. Lanes 0 to 4 produced `env00` to `env04`, as upstream's layout does. Ten
 episodes are too few to compare with the 72.3 % upstream reports for this checkpoint.
 
+### Result: INT8 asym, 24 tasks × 10 episodes
+
+```bash
+N_EPISODES=10 bash $R rldx11_ov_int8asym exports/rldx11_robocasa_ov_a64_int8asym GPU.0
+```
+
+Export `exports/rldx11_robocasa_ov_a64_int8asym` (`int8_asym`) on the B70 (`GPU.0`), f16 inference precision
+(device default), seed 42, 5 lanes × 2 episodes per task, 16 actions per call, 720 steps (1,000 for
+`OpenDoubleDoor`), `MAX_PARALLEL=4`. Outputs are in `output_final/robocasa/rldx11_ov_int8asym/`.
+
+| | Value |
+|---|---|
+| **Success** | **72.9 % (175/240)** |
+| 95 % binomial interval | about ±5.6 points (67.3 % to 78.5 %) |
+| Upstream, same checkpoint (Thor, 1,200 episodes, mean of 2 runs) | 73.1 % `compile`, 71.4 % `any:fp8`; README 72.3 % |
+| Policy calls | 5,921 (mean 24.7 per episode) |
+| Wall time | about 60 min (17:31 to 18:31) |
+| Server errors / rejected requests | none |
+
+INT8 asym matches upstream: 72.9 % is between upstream's `compile` and `any:fp8` numbers, and both are
+well inside the interval. Ten episodes per task cannot resolve a gap of 1 to 2 points; that needs the
+full 50-episode run and an f16 run on the same protocol.
+
+By task family:
+
+| Family | Tasks | Success |
+|---|---|---|
+| Sink (faucet on/off, spout) | 3 | 100 % (30/30) |
+| Drawer (open/close) | 2 | 95.0 % (19/20) |
+| Microwave (on/off) | 2 | 95.0 % (19/20) |
+| Doors (open/close, single/double) | 4 | 77.5 % (31/40) |
+| Coffee (setup mug, serve mug, press button) | 3 | 66.7 % (20/30) |
+| Stove (on/off) | 2 | 60.0 % (12/20) |
+| Pick and place | 8 | 55.0 % (44/80) |
+
+Per task (mean policy calls over all episodes and over successful ones; the limit is 45 calls, 63 for
+`OpenDoubleDoor`):
+
+| Task | Success | Mean calls (all / success) |
+|---|---|---|
+| CloseDrawer | 10/10 | 12.5 / 12.5 |
+| CloseSingleDoor | 10/10 | 16.5 / 16.5 |
+| TurnOffMicrowave | 10/10 | 17.0 / 17.0 |
+| TurnOffSinkFaucet | 10/10 | 11.1 / 11.1 |
+| TurnOnSinkFaucet | 10/10 | 14.1 / 14.1 |
+| TurnSinkSpout | 10/10 | 10.2 / 10.2 |
+| CoffeePressButton | 9/10 | 11.8 / 8.1 |
+| OpenDrawer | 9/10 | 16.5 / 13.3 |
+| TurnOnMicrowave | 9/10 | 20.0 / 17.2 |
+| OpenDoubleDoor | 8/10 | 47.5 / 43.6 |
+| PnPCounterToCab | 8/10 | 23.6 / 18.2 |
+| PnPCounterToStove | 8/10 | 24.0 / 18.8 |
+| CoffeeServeMug | 7/10 | 27.0 / 19.3 |
+| OpenSingleDoor | 7/10 | 26.2 / 18.1 |
+| PnPCounterToSink | 7/10 | 30.8 / 24.7 |
+| PnPSinkToCounter | 7/10 | 24.1 / 15.1 |
+| PnPStoveToCounter | 7/10 | 24.6 / 15.9 |
+| TurnOnStove | 7/10 | 21.2 / 11.0 |
+| CloseDoubleDoor | 6/10 | 32.8 / 24.7 |
+| PnPCabToCounter | 5/10 | 33.9 / 22.8 |
+| TurnOffStove | 5/10 | 28.2 / 11.4 |
+| CoffeeSetupMug | 4/10 | 33.2 / 15.5 |
+| PnPMicrowaveToCounter | 2/10 | 40.3 / 21.5 |
+| PnPCounterToMicrowave | 0/10 | 45.0 / — |
+
+Observations:
+- Every one of the 65 failures ran to the step limit. None ended early, so failures are the policy not
+  finishing the task, not crashes or server faults.
+- The microwave pick-and-place tasks are the weak spot: `PnPCounterToMicrowave` 0/10 and
+  `PnPMicrowaveToCounter` 2/10. Whether this is INT8 or the checkpoint itself needs the f16 or torch run
+  on the same seeds.
+- Per lane (scene layout seed), success ranges from 31/48 (lane 0) to 39/48 (lane 3).
+- Per-task rates have n=10 (±about 30 points), so do not read single tasks as regressions.
+
 For a torch baseline on the 3090, use the upstream launcher unchanged:
 `N_GPUS=1 bash run_scripts/eval/robocasa_kitchen/eval_robocasa.sh RLWRLD/RLDX-1.1-FT-ROBOCASA` (`compile`, 5
 environments per process, then its swap chain). `N_EPISODES` and `TASK_LIMIT` work the same way for
@@ -468,8 +542,10 @@ frames, 24 kitchen tasks × 50 episodes, success 73.1 % `compile` / 71.4 % `any:
       `compile`, `any:bf16`, `--limits-batch 3`) and on the B70 (OV f16, INT8).
 - [x] OV closed-loop runner `run_scripts/export/eval_robocasa_openvino.sh` (upstream `eval_robocasa.sh`
       untouched): same protocol, each lane at batch 1. Quick check passed (2 tasks × 5 episodes).
-- [ ] Torch baseline on the RTX 3090 with upstream `eval_robocasa.sh` (`N_GPUS=1`), then OV f16 and
-      INT8 on the B70. Smoke with `N_EPISODES=10` first (must be a multiple of 5).
+- [x] OV INT8 asym on the B70, `N_EPISODES=10`: 72.9 % (175/240).
+- [ ] OV f16 on the B70, `N_EPISODES=10`, same protocol, to compare with INT8 asym.
+- [ ] Torch baseline on the RTX 3090 with upstream `eval_robocasa.sh` (`N_GPUS=1`).
+- [ ] Full protocol (`N_EPISODES=50`) for INT8 asym and f16; resumes the 10-episode runs.
 
 Engineering:
 - [ ] Batch > 1 export, so `N_ENVS=5` works and throughput can be measured.
