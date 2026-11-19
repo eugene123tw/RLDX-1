@@ -50,7 +50,7 @@ and are parsed by `tyro`.
 |---|---|---|
 | `--model-path` | required | HF hub id or absolute path to a trained RLDX-1.1 checkpoint. Processor is loaded from `{model_path}/processor`. |
 | `--embodiment-tag` | `GENERAL_EMBODIMENT` | Category-specific MLP head to use. Complete list in `rldx/data/embodiment_tags.py`. |
-| `--device` | `cuda` | Pass `cuda:1` to pin to a specific GPU. |
+| `--device` | `cuda` | Pass `cuda:1` to pin to a specific GPU, or `xpu` for an Intel GPU (see [installation](installation.md#intel-xpu-arc--data-center-gpu)). |
 
 ### Replaying a dataset
 

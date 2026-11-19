@@ -1313,7 +1313,12 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         if (
             attention_mask_is_canonical
             and attention_mask is not None
-            and self.config._attn_implementation == "flash_attention_2"
+            and (
+                self.config._attn_implementation == "flash_attention_2"
+                # Planned text layers attend through ``text_attention``, never this mask;
+                # create_causal_mask would build a 4D SDPA mask they reject.
+                or kwargs.get("text_attention") is not None
+            )
         ):
             attention_mask = _prepare_canonical_fa2_mask(
                 attention_mask, inputs_embeds, cache_position, past_key_values

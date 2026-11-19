@@ -176,6 +176,8 @@ class StepProfiler:
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.synchronize()
         except Exception:
             # Profiler must never break the inference path.
             pass

@@ -150,6 +150,36 @@ print(torch.__version__, torch.cuda.get_device_capability())
 - If you are not on Blackwell, prefer the Standard install — pixi will
   work but pulls a larger conda payload (CUDA 12.8 toolkit) than uv needs.
 
+## Intel XPU (Arc / Data Center GPU)
+
+Inference runs on Intel GPUs through PyTorch's XPU backend. flash-attn has no
+XPU build, so the backbone falls back to SDPA automatically when `flash_attn`
+is not installed. Use a separate venv: the XPU wheels replace the CUDA `torch`
+pin, and `flash-attn`, `torchcodec` and `deepspeed` are left out (inference
+does not import them).
+
+```bash
+uv venv .venv-xpu --python 3.10
+uv pip install --python .venv-xpu/bin/python torch==2.14.1 torchvision==0.29.1 \
+    --index-url https://download.pytorch.org/whl/xpu
+python3 - > /tmp/rldx_xpu_reqs.txt <<'EOF'
+import re
+deps = re.search(r"dependencies = \[(.*?)\n\]", open("pyproject.toml").read(), re.S).group(1)
+skip = ("torch==", "torchvision==", "flash-attn", "torchcodec", "deepspeed")
+print("\n".join(d for d in re.findall(r'^\s*"([^"]+)"', deps, re.M) if not d.startswith(skip)))
+EOF
+uv pip install --python .venv-xpu/bin/python -r /tmp/rldx_xpu_reqs.txt
+uv pip install --python .venv-xpu/bin/python -e . --no-deps
+
+.venv-xpu/bin/python -c "import torch; print(torch.xpu.is_available(), torch.xpu.get_device_name(0))"
+```
+
+Serve with `--device xpu`. All bf16 runtime profiles (`eager`, `compile`,
+`any:bf16`) work; `any:bf16` captures whole-call XPU graphs instead of CUDA
+graphs. The fp8/nvfp4 presets rely on CUDA kernels and are not supported on
+XPU. When an NVIDIA GPU is also visible, the loader sets
+`TRITON_DEFAULT_BACKEND=intel` so `torch.compile` targets the XPU.
+
 ## Quantized inference (`quantize`)
 
 The `quantize` pixi environment pins CUDA 13 torch / triton / flashinfer /

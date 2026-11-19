@@ -1,4 +1,4 @@
-"""One CUDA graph per input shape for the whole inference call."""
+"""One device graph (CUDA or XPU) per input shape for the whole inference call."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from rldx.planner import tree
 
 
 _CONSTANTS = (str, int, float, bool, torch.dtype, torch.device)
+_GRAPH_CLASSES = {"cuda": "CUDAGraph", "xpu": "XPUGraph"}
 
 
 def signature(value: Any) -> tuple[Any, list[torch.Tensor]]:
@@ -36,21 +37,28 @@ def _clone(value: Any) -> Any:
 
 @dataclasses.dataclass(frozen=True)
 class _Graph:
-    graph: torch.cuda.CUDAGraph
+    graph: Any
     inputs: list[torch.Tensor]
     noise: list[torch.Tensor]
     outputs: Any
 
 
 class ForwardGraphs:
-    def __init__(self, call: Callable[[dict], Any]) -> None:
+    def __init__(self, call: Callable[[dict], Any], device: torch.device | str = "cuda") -> None:
+        device_type = torch.device(device).type
+        if device_type not in _GRAPH_CLASSES:
+            raise ValueError(f"forward graphs need a CUDA or XPU device, got {device_type!r}")
         self._call = call
+        self._device_type = device_type
+        self._backend = torch.get_device_module(device_type)
         self._graphs: dict[Any, _Graph] = {}
 
     def run(self, inputs: dict) -> Any:
         key, leaves = signature(inputs)
         if key not in self._graphs:
-            with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            with torch.random.fork_rng(
+                devices=[self._backend.current_device()], device_type=self._device_type
+            ):
                 self._graphs[key] = self._capture(inputs)
             rank_zero_print(f"[forward graph] captured {len(self._graphs)} input shapes")
         entry = self._graphs[key]
@@ -70,13 +78,14 @@ class ForwardGraphs:
             shapes.append((shape, dtype, device))
             return torch.randn(shape, dtype=dtype, device=device)
 
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
+        backend = self._backend
+        side = backend.Stream()
+        side.wait_stream(backend.current_stream())
+        with backend.stream(side):
             with noise_source(record):
                 self._call(dict(static))
             self._call(dict(static))
-        torch.cuda.current_stream().wait_stream(side)
+        backend.current_stream().wait_stream(side)
         noise = [torch.empty(shape, dtype=dtype, device=device) for shape, dtype, device in shapes]
         handed = iter(noise)
 
@@ -88,7 +97,7 @@ class ForwardGraphs:
                 )
             return buffer
 
-        graph = torch.cuda.CUDAGraph()
-        with noise_source(hand), torch.cuda.graph(graph):
+        graph = getattr(backend, _GRAPH_CLASSES[self._device_type])()
+        with noise_source(hand), backend.graph(graph):
             outputs = self._call(dict(static))
         return _Graph(graph, static_inputs, noise, outputs)

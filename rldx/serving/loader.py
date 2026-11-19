@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,9 @@ def load_model(
     *,
     dtype: torch.dtype,
 ) -> Any:
+    if torch.device(device).type == "xpu":
+        # Triton refuses to pick a driver when CUDA is visible too; compile regions target XPU.
+        os.environ.setdefault("TRITON_DEFAULT_BACKEND", "intel")
     model = RLDX.from_pretrained(
         model_dir,
         config=config,

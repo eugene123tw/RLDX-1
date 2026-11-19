@@ -1,4 +1,5 @@
 from functools import partial
+import importlib.util
 import os
 from typing import Optional
 
@@ -32,7 +33,10 @@ from rldx.planner.input.spec import Qwen3VLInputSpec
 # Production stays on FlashAttention-2 for throughput; environments that
 # cannot build flash-attn (e.g. brand-new toolchains, CI runners with no
 # nvcc) can opt out via ``RLDX_ATTN_IMPL=sdpa`` without touching code.
-_DEFAULT_ATTN_IMPL = os.environ.get("RLDX_ATTN_IMPL", "flash_attention_2")
+# Without flash-attn installed (e.g. Intel XPU) the default is SDPA.
+_DEFAULT_ATTN_IMPL = os.environ.get("RLDX_ATTN_IMPL") or (
+    "flash_attention_2" if importlib.util.find_spec("flash_attn") is not None else "sdpa"
+)
 
 
 class VTCQwen3VLBackbone(nn.Module):

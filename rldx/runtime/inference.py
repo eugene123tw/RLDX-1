@@ -68,7 +68,7 @@ class InferenceRuntime:
         )
         self._inference_mode = inference_mode
         self._forward_graphs = (
-            ForwardGraphs(self._forward)
+            ForwardGraphs(self._forward, self._device)
             if profile is not None and profile.text_bucket is not None
             else None
         )
