@@ -188,6 +188,7 @@ class SingleStreamBlock(nn.Module):
         time_token: Optional[torch.Tensor] = None,
         block_idx: int = 0,
         attn_mask: Optional[torch.Tensor] = None,
+        row_scale: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass following Flux SingleStreamBlock pattern.
@@ -196,6 +197,7 @@ class SingleStreamBlock(nn.Module):
         pe: RoPE matrices, shape (B, N, head_dim//2, 2, 2) if use_rope else None
         shared_modulation: Optional ModulationOut (shift, scale, gate) when temb_type="shared_mod"
         time_token: Optional time token indicator - if not None, use identity modulation
+        row_scale: Optional (N, 1) per-row factor on the residual update (see MSAT.rescale_vl_rows)
         """
         # If time_token is provided (not None), use identity modulation (time_token handles conditioning)
         use_identity_mod = time_token is not None
@@ -267,7 +269,8 @@ class SingleStreamBlock(nn.Module):
         output = self.linear2(torch.cat([attn, mlp_out], dim=-1))  # (B, N, inner_dim)
         # Apply post-norm to the final output (Z-Image style: norm after combining branches)
         output = self.post_norm(output)
-        return x + mod.gate * self.dropout(output)
+        gate = mod.gate if row_scale is None else mod.gate * row_scale
+        return x + gate * self.dropout(output)
 
 
 class DoubleStreamBlock(nn.Module):

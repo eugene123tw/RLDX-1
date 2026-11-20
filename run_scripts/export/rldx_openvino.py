@@ -78,8 +78,8 @@ from rldx.serving.server import serve
 META_FILE = "rldx_openvino.json"
 XML_FILE = "rldx.xml"
 F16_MAX = 65504.0
-# Power of two, so dividing the weights and multiplying them back is exact.
-F16_SAFE_RESIDUAL_SCALE = 16.0
+# Upstream's recipe (MSAT.rescale_vl_rows): GR1's 3.85e5 VL-row peak drops to ~6e3.
+F16_SAFE_VL_ROW_SCALE = 1 / 64
 TRANSFORMERS_KWARGS = {"trust_remote_code": False, "use_fast": True}
 
 
@@ -197,26 +197,29 @@ def planned_call(policy: RLDXPolicy, observation: dict) -> InferenceCall:
 
 @contextmanager
 def activation_peaks(root: nn.Module, msat: nn.Module) -> Iterator[dict]:
-    """Max |x| per module output, plus the SA residual stream (inputs of its reader norms)."""
+    """Max |x| per module output, plus the MSAT single-stream residual split into VL / SA rows."""
     peaks: dict[str, float] = {}
+    n_vl = {"rows": 0}
 
     def record(name: str, value: torch.Tensor) -> None:
         if isinstance(value, torch.Tensor) and value.is_floating_point() and value.numel():
             peaks[name] = max(peaks.get(name, 0.0), float(value.detach().abs().amax()))
+
+    def single_stream(_m, args) -> None:
+        record("<msat.single.vl_rows>", args[0][:, : n_vl["rows"]])
+        record("<msat.single.sa_rows>", args[0][:, n_vl["rows"] :])
 
     handles = [
         m.register_forward_hook(lambda _m, _a, out, n=n: record(n, out))
         for n, m in root.named_modules()
         if n
     ]
-    try:
-        readers = msat.residual_stream()[1]
-    except ValueError:
-        readers = []
-    handles += [
-        norm.register_forward_pre_hook(lambda _m, args: record("<msat.sa_residual>", args[0]))
-        for norm in readers
-    ]
+    handles.append(
+        msat.vl_proj_to_sa.register_forward_hook(
+            lambda _m, _a, out: n_vl.__setitem__("rows", out.shape[1])
+        )
+    )
+    handles += [blk.pre_norm.register_forward_pre_hook(single_stream) for blk in msat.single_blocks]
     try:
         yield peaks
     finally:
@@ -362,8 +365,8 @@ def cmd_export(args: argparse.Namespace) -> int:
     print("[export] largest fp32 activations (|x| > f16 max overflows on OpenVINO GPU f16):")
     for name, value in top:
         print(f"    {value:12.1f}  {name}{'  <-- > f16 max' if value > F16_MAX else ''}")
-    residual_peak = peaks.get("<msat.sa_residual>", 0.0)
-    print(f"[export] MSAT SA residual peak {residual_peak:.1f}")
+    residual_peaks = {k: v for k, v in peaks.items() if k.startswith("<msat.single.")}
+    print(f"[export] MSAT single-stream residual peaks {residual_peaks}")
 
     if text_bucket is not None:
         # Padding is handled by the planned text attention layout: it must match no padding.
@@ -383,16 +386,20 @@ def cmd_export(args: argparse.Namespace) -> int:
         )
 
     if args.f16_safe:
-        # Both patches are exact in fp32; they only change where values live for GPU float16.
-        msat.rescale_residual_stream(args.residual_scale)
+        # Both patches leave fp32 outputs unchanged (up to the VL-row norm eps).
+        msat.rescale_vl_rows(args.vl_row_scale)
         export.untie_first_denoising_step()
-        with torch.no_grad():
+        with torch.no_grad(), activation_peaks(export, msat) as patched_peaks:
             patched = export(*sample)
         err = float((patched - reference).abs().max())
         print(f"[export] f16-safe rescale exactness (fp32): max|diff| = {err:.3e}")
         if err > args.rescale_tol:
             raise RuntimeError(f"f16-safe rescale changed outputs by {err:.3e}")
-        print(f"[export] residual peak after rescale ~{residual_peak / args.residual_scale:.1f}")
+        residual_peaks = {k: v for k, v in patched_peaks.items() if k.startswith("<msat.single.")}
+        print(f"[export] single-stream residual peaks after rescale {residual_peaks}")
+        over = {n: v for n, v in patched_peaks.items() if v > F16_MAX}
+        if over:
+            print(f"[export] WARNING: still above f16 max after rescale: {over}")
     with torch.no_grad(), warnings.catch_warnings():
         # A flood of TracerWarnings can fill the pipe OpenVINO captures them through and hang.
         warnings.simplefilter("ignore")
@@ -416,10 +423,10 @@ def cmd_export(args: argparse.Namespace) -> int:
         "input_spec": asdict(model.backbone.input_spec),
         "layout": export.layout,
         "f16_safe": args.f16_safe,
-        "residual_scale": args.residual_scale if args.f16_safe else 1.0,
+        "vl_row_scale": args.vl_row_scale if args.f16_safe else 1.0,
         "compress_to_fp16": args.compress_to_fp16,
         "fp32_activation_peaks_top": top,
-        "sa_residual_peak": residual_peak,
+        "single_stream_residual_peaks": residual_peaks,
     }
     (args.output / META_FILE).write_text(json.dumps(meta, indent=2))
     print(f"[export] saved {args.output / XML_FILE}")
@@ -722,8 +729,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--text-bucket", type=int, default=64,
                    help="pad prompts to a multiple of this many tokens (0 = exact length)")
     p.add_argument("--no-f16-safe", dest="f16_safe", action="store_false",
-                   help="skip the MSAT residual rescale and the GPU first-step untie")
-    p.add_argument("--residual-scale", type=float, default=F16_SAFE_RESIDUAL_SCALE)
+                   help="skip the MSAT VL-row rescale and the GPU first-step untie")
+    p.add_argument("--vl-row-scale", type=float, default=F16_SAFE_VL_ROW_SCALE)
     p.add_argument("--rescale-tol", type=float, default=1e-3)
     p.add_argument("--no-compress-to-fp16", dest="compress_to_fp16", action="store_false")
     p.add_argument("--hidden-alignment", type=int, default=1,

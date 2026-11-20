@@ -65,6 +65,9 @@ N_EPISODES=10 bash run_scripts/export/eval_libero_openvino.sh rldx11_ov_int8 \
 | Everything else (norms, SDPA, RoPE, residual adds) | FP16 | FP16 |
 | MSAT state-action residual stream | rescaled by 1/16 | rescaled by 1/16 |
 
+The IRs measured in this report use the 1/16 rescale below. Later exports use upstream's recipe
+instead (see [f16 overflow: upstream's fix](#f16-overflow-upstreams-fix)).
+
 - **The OV analogue of RLDX's `any:fp8`.** `any:fp8` is W8A8 e4m3 with one scale per weight channel and
   activation scales computed per row on every call, with no calibration (`torch._scaled_mm`). Xe2 has no
   FP8 matrix units, so the closest OV recipe is INT8 W8A8 with the same scale structure: per-channel
@@ -588,6 +591,202 @@ Observations:
 - This run alone cannot say whether the stove and microwave weakness comes from INT8 or from the
   checkpoint. That needs the f16 run (or torch) on the same protocol.
 
+## f16 overflow: upstream's fix
+
+RLWRLD confirmed the overflow is expected on every released RLDX-1.1 checkpoint and located it. It
+is not in the state and action tokens. The MSAT single-stream blocks run one sequence of 64 cognition
+tokens followed by the time, state and action tokens. The cognition tokens enter through
+`action_model.model.vl_proj_to_sa`, and a few of its output channels (channel 42 is the largest) have
+large weights. Only the cognition rows exceed the f16 range. The state and action rows stay below
+about 2k. Upstream's fp32 peaks on synthetic inputs: RoboCasa 58k to 66k, LIBERO about 84k, GR-1 up
+to 385k. Ours (73k to 111k) are in line.
+
+The output reads only the state and action rows, and the cognition rows reach them only through each
+block's pre-norm, a LayerNorm without affine parameters. So the cognition rows can live at a smaller
+scale. The export (`rldx_openvino.py export`, `--vl-row-scale`, default 1/64) now does:
+
+1. Multiply the weight and bias of `vl_proj_to_sa` by s = 1/64 (`MSAT.rescale_vl_rows`).
+2. In each of the 8 single-stream blocks, scale the residual update per row before the add:
+   `x = x + r * F(LN(x))`, with r = s for the 64 cognition rows and 1 for the rest
+   (`SingleStreamBlock(row_scale=...)`).
+
+The only change in exact arithmetic is the norm eps on the cognition rows (effectively eps / s²).
+Upstream's numbers: fp32 relative difference at most 1.6e-6; GR-1 peak 385k down to about 6k; f16 vs
+fp32 0.08 % to 0.11 % relative L2 (their bf16 path: 0.7 % to 1.0 %). Our synthetic check of the code
+(cognition rows pushed to 162k): fp32 relative difference 2e-7, the original gives non-finite f16
+outputs, the rescaled one 7e-4 relative L2. The state and action rows are untouched.
+
+Compared with the 1/16 rescale used for the IRs above: 1/16 would leave GR-1 at about 24k. The new
+recipe also touches one layer's weights instead of every writer to the stream, and leaves the double
+blocks alone. The export prints the single-stream peaks split into cognition rows
+(`<msat.single.vl_rows>`) and state/action rows (`<msat.single.sa_rows>`), before and after the
+rescale, and warns if anything is still above the f16 limit.
+
+Upstream also asked that the backbone `LayerNorm` / `RMSNorm` variance stays in fp32: the residual
+stream peaks around 12k, which fits f16, but its square does not. The OV GPU plugin already does this.
+On the RoboCasa f16 IR every norm compiles to a fused `rms` (197) or `MVN` (156) kernel, and a
+stand-alone test at 12k magnitude stays finite with about 4e-4 relative L2 error.
+
+## GR-1 Tabletop (`RLDX-1.1-FT-GR1`): validation plan
+
+Upstream asked for GR-1 tabletop success rates of the f16 and INT8 builds next to a bf16 run on the
+same setup: this checkpoint has the largest peak they measured (385k), so it also tests the fix.
+
+**The benchmark.** GR-1 Tabletop is a simulated benchmark: NVIDIA's `robocasa-gr1-tabletop-tasks`
+(from GR00T), a GR-1 humanoid with Fourier hands, one ego camera at 256². It has 24 tasks: 18 object
+rearrangement and 6 articulated objects. `RLDX-1.1-FT-GR1` is fine-tuned on the GR-1 sets of
+`nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim`, embodiment tag `GENERAL_EMBODIMENT`. Upstream
+reports **60.3 %** (24 tasks × 50 episodes; README, `run_scripts/eval/gr1_tabletop/README.md`).
+
+**Where upstream's number comes from.** `run_scripts/eval/gr1_tabletop/eval_gr1.sh`:
+- 24 tasks split over 8 shards, each with its own `run_rldx_server.py` (`compile`, bf16), one shard
+  per card at a time;
+- every rollout at `n_envs 1`, seed 42, 5 lanes × 10 episodes per task, 8 actions per call, at most
+  720 steps, uniform denoising timesteps;
+- the reset protocol (`GR1_PROTOCOL=on`): a 5 s physics settle after reset (a patch to the simulator)
+  and a frozen seed manifest that swaps 130 broken scene slots for pre-validated seeds. Results are not
+  comparable across the switch;
+- score: pooled success over the per-task `simulation_results.csv`.
+
+**OV runner.** `run_scripts/export/eval_gr1_openvino.sh` is the GR-1 counterpart of
+`eval_robocasa_openvino.sh`. Upstream `eval_gr1.sh` is untouched. The OV runner:
+- starts one `rldx_openvino.py serve --backend openvino` server on the export, then runs
+  `rldx/eval/rollout_policy.py` from the GR-1 venv;
+- reads the 24 task names from upstream `eval_gr1.sh` and uses its protocol: seed 42, 5 lanes
+  (`--n_envs 1 --env_layout 5 --env_idx_offset 0..4`), 8 actions per call, 720 steps;
+- turns on the reset protocol the way upstream does (`GR1_PROTOCOL_SEED`, `GR1_RESET_SETTLE_S=5.0`,
+  `GR1_EPISODE_SEED_MANIFEST`, `gr1_protocol` on `PYTHONPATH`, on the rollout only), and refuses to run
+  if the settle or determinism patch is missing from the submodule;
+- uses one server for all tasks instead of 8 shard servers. The scenes are the same, since the seed
+  manifest is keyed on lane and episode, not shard. The noise stream differs from upstream anyway
+  (OV draws it from the CPU torch RNG), so the comparison is on success rate, not per episode;
+- runs up to `MAX_PARALLEL` tasks at once, with a task's 5 lanes in turn;
+- writes `manifest.json` (export, compression, `vl_row_scale`, device, precision, protocol, seed
+  manifest hash) and refuses to resume a directory made with another setting;
+- prints `[progress]` lines from the episode videos, and at the end a per-task table (`summary.csv`)
+  and the pooled rate from the task CSVs, as upstream does. It fails if a task did not record
+  `N_EPISODES` episodes, and prints how many `[seed-manifest]` substitutions were logged (a full
+  50-episode run logs about 130);
+- with `RECORD_DIR`, also saves every `RECORD_EVERY`-th observation as a parity fixture.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `N_EPISODES` | 50 | Episodes per task, a multiple of 5 (one fifth per lane) |
+| `TASKS` | all 24 | Comma-separated subset, with or without the `_GR1ArmsAndWaistFourierHands_Env` suffix |
+| `TASK_LIMIT` | all | Keep the first n tasks of the list |
+| `OV_PRECISION` | device default (f16 on GPU) | OV inference precision hint |
+| `RECORD_DIR` / `RECORD_EVERY` | off / 10 | Save observations as parity fixtures |
+| `MAX_PARALLEL` (4th argument) | 4 | Tasks in flight against the one server |
+
+**Setup on a fresh machine.** As for RoboCasa, the script installs nothing and stops with the
+missing step:
+
+1. **Repo, model venv, Intel GPU:** steps 1 to 3 of
+   [Running latency and parity on a new machine](#running-latency-and-parity-on-a-new-machine).
+2. **Simulator:** `INSTALL_FLASH_ATTN=0 bash run_scripts/eval/gr1_tabletop/setup_gr1.sh`. It checks out
+   the `robocasa-gr1-tabletop-tasks` submodule, applies the determinism and reset-settle patches, builds
+   the venv with robosuite 1.5.1 and downloads the tabletop assets. The patches edit the submodule, so
+   `git pull` does not bring them.
+3. **Checkpoint:** `.venv/bin/hf download RLWRLD/RLDX-1.1-FT-GR1`. The GR-1 README warns that
+   `max_num_embodiments` in `config.json` can disagree with the weights; check the first dimension of
+   `action_model.action_decoder.layer1.W` before exporting.
+4. **Exports:** `export` with the new rescale, then `quantize --mode int8_sym` and `--mode int8_asym`
+   (commands below and in the script header). CPU only, about 30 GB of RAM.
+
+**Steps.**
+
+```bash
+cd ~/git/RLDX-1; S=run_scripts/export/rldx_openvino.py; R=run_scripts/export/eval_gr1_openvino.sh
+# 1. Export. Check the log: <msat.single.vl_rows> should drop from ~3.85e5 to ~6e3, sa_rows unchanged
+.venv/bin/python $S export --model-path RLWRLD/RLDX-1.1-FT-GR1 --hidden-alignment 64 \
+    --output exports/rldx11_gr1_ov_a64
+.venv/bin/python $S quantize --export-dir exports/rldx11_gr1_ov_a64 \
+    --output exports/rldx11_gr1_ov_a64_int8 --mode int8_sym
+.venv/bin/python $S quantize --export-dir exports/rldx11_gr1_ov_a64 \
+    --output exports/rldx11_gr1_ov_a64_int8asym --mode int8_asym
+# Optional evidence for upstream: without the fix, GPU f16 overflows (expect NaN in parity).
+# --no-f16-safe also skips the GPU first-step untie, so a NaN here is not only the rescale's doing.
+.venv/bin/python $S export --model-path RLWRLD/RLDX-1.1-FT-GR1 --hidden-alignment 64 \
+    --no-f16-safe --output exports/rldx11_gr1_ov_a64_nofix
+# 2. Smoke runs (2 tasks x 5 episodes each); the f16 one also records parity fixtures
+N_EPISODES=5 TASKS=PnPCanToDrawerClose,PnPCupToDrawerClose RECORD_DIR=fixtures/gr1 \
+    bash $R rldx11_gr1_ov_f16_smoke exports/rldx11_gr1_ov_a64 GPU.0 2
+for q in int8 int8asym; do
+  N_EPISODES=5 TASKS=PnPCanToDrawerClose,PnPCupToDrawerClose \
+      bash $R rldx11_gr1_ov_${q}_smoke exports/rldx11_gr1_ov_a64_$q GPU.0 2
+done
+# 3. Open-loop parity vs torch fp32 CPU (cached), with torch bf16 as the calibration row
+.venv/bin/python $S parity --export-dir exports/rldx11_gr1_ov_a64 --fixtures fixtures/gr1 \
+    --ref-device cpu --ref-dtype fp32 --ref-cache fixtures/rldx11_gr1_ref_fp32.npz \
+    --torch-candidates cuda:bf16 cuda:bf16:any:fp8 --ov-devices CPU GPU.0
+.venv/bin/python $S parity --export-dir exports/rldx11_gr1_ov_a64_int8asym --fixtures fixtures/gr1 \
+    --ref-device cpu --ref-dtype fp32 --ref-cache fixtures/rldx11_gr1_ref_fp32.npz --ov-devices GPU.0
+.venv/bin/python $S parity --export-dir exports/rldx11_gr1_ov_a64_int8 --fixtures fixtures/gr1 \
+    --ref-device cpu --ref-dtype fp32 --ref-cache fixtures/rldx11_gr1_ref_fp32.npz --ov-devices GPU.0
+# 4. Closed loop, full protocol: OV f16 and INT8 asym on the B70 (INT8 sym too if its parity passes)
+N_EPISODES=50 bash $R rldx11_gr1_ov_f16 exports/rldx11_gr1_ov_a64 GPU.0
+N_EPISODES=50 bash $R rldx11_gr1_ov_int8asym exports/rldx11_gr1_ov_a64_int8asym GPU.0
+# 5. Torch bf16 baseline on the RTX 3090: upstream launcher unchanged (8 shards in turn on one card)
+N_GPUS=1 CUDA_VISIBLE_DEVICES=0 bash run_scripts/eval/gr1_tabletop/eval_gr1.sh RLWRLD/RLDX-1.1-FT-GR1
+# 6. Latency, as for RoboCasa: bench per IR on the B70 (blank observation is enough; shapes are static)
+for d in rldx11_gr1_ov_a64 rldx11_gr1_ov_a64_int8 rldx11_gr1_ov_a64_int8asym; do
+  .venv/bin/python $S bench --backend openvino --export-dir exports/$d --ov-device GPU.0 \
+      --ov-precision f16 --iters 50 --report results/ov_bench/gr1_bench_$d.json
+done
+# Torch reference on the 3090, same checkpoint
+.venv/bin/python $S bench --backend torch --model-path RLWRLD/RLDX-1.1-FT-GR1 --device cuda \
+    --runtime-profile compile --iters 50 --report results/ov_bench/gr1_bench_torch_compile.json
+# benchmark_app without the Python host code, fed one recorded GR-1 fixture (needs step 2)
+MAP=$(.venv/bin/python ../physical-ai-studio/tmp_scripts/dump_ov_bench_inputs.py \
+    exports/rldx11_gr1_ov_a64 fixtures/gr1/000000 results/ov_bench/inputs_gr1 | tail -1)
+for d in rldx11_gr1_ov_a64 rldx11_gr1_ov_a64_int8 rldx11_gr1_ov_a64_int8asym; do
+  .venv/bin/benchmark_app -m exports/$d/rldx.xml -d GPU.0 -infer_precision f16 -hint latency \
+      -nireq 1 -niter 100 -i "$MAP" -iop position_ids:i64 \
+      -report_type no_counters -json_stats -report_folder results/ov_bench/benchmark_app/$d
+done
+```
+
+The `bench` and `benchmark_app` notes from the RoboCasa section apply unchanged: feed real inputs, pass
+`-iop position_ids:i64`, and ignore the reported FPS (it counts camera frames as the batch). For the
+B390, run the same `bench` loop on the NUC with the exports copied over.
+
+The recorded fixtures come from the OV f16 policy's trajectories. They are still real simulator
+observations, which is all `parity` needs. To record from torch instead, start
+`rldx_openvino.py serve --runtime-profile eager --record-dir fixtures/gr1` and drive it with
+`rollout_policy.py` and the protocol variables above, as for RoboCasa.
+
+Outputs: the OV runs go to `output_final/gr1_tabletop/<RUN_NAME>/` (per-task videos,
+`simulation_results.csv`, `eval.log`, plus `server.log`, `manifest.json` and `summary.csv`). The torch
+baseline goes to `output_final/gr1_tabletop/RLWRLD_RLDX-1.1-FT-GR1/h8_uniform_ep50_seed42_resetproto/`.
+
+**How to read the results.**
+- Pass for the fix: the export shows the cognition-row peak under the f16 limit, f16 parity has no NaN,
+  and `server.log` shows no NaN or inf.
+- Parity bar: the absolute 5e-2 max does not work on GR-1. The hand actions are discrete (targets of
+  ±1.5 and ±3, normalized to ±1), so at an open/close transition any precision change flips a hand
+  joint by the full range: normalized max |diff| about 2.0, decoded about 6. Torch bf16 does the same
+  (2.01), so compare with the calibration rows instead: f16 mean and min cosine no worse than torch
+  bf16, INT8 no worse than `any:fp8`. OV f32 on CPU must still be tight (no flips).
+- First parity run (64 fixtures from the f16 smoke run, torch fp32 CPU reference):
+
+  | Variant | max \|diff\| | mean \|diff\| | min cosine |
+  |---|---|---|---|
+  | *torch bf16, RTX 3090* | *2.01* | *1.10e-3* | *0.98096* |
+  | *torch `any:fp8`, RTX 3090* | *2.02* | *2.10e-3* | *0.98079* |
+  | OV f32, CPU | 8.7e-3 | 1.5e-5 | 1.00000 |
+  | OV f16, B70 | 2.02 | 4.8e-4 | 0.98126 |
+
+  OV f16 is at least as close to fp32 as upstream's bf16 path; the max comes from the same hand flips.
+- INT8 asym: within upstream `any:fp8` drift on parity, as on RoboCasa.
+- Closed loop: at about 60 % over 1,200 episodes the 95 % interval is about ±2.8 points, so the f16,
+  INT8 and bf16 runs agree if they are inside each other's interval and near 60.3 %. Gaps of 1 to 2
+  points cannot be resolved. Closed loop is not bit-reproducible (RoboCasa INT8 moved 3 points between
+  identical runs).
+- Report upstream's 60.3 % alongside ours, but the bf16 baseline is our own run on the same scenes.
+
+**Status.** Not run yet. The submodule is not initialized, the GR-1 venv does not exist and the
+checkpoint is not downloaded on this machine.
+
 ## Artifacts
 
 | Path | What |
@@ -595,6 +794,7 @@ Observations:
 | `RLDX-1/run_scripts/export/rldx_openvino.py` | `export` (`--hidden-alignment`), `quantize` (NNCF), `parity`, `bench`, `serve`, `--ov-config KEY=VALUE` |
 | `RLDX-1/run_scripts/export/eval_libero_openvino.sh` | Closed-loop LIBERO with the OV server; `N_ENVS`, `[progress]` lines |
 | `RLDX-1/run_scripts/export/eval_robocasa_openvino.sh` | Closed-loop RoboCasa with the OV server; full or partial (`N_EPISODES`, `TASKS`, `TASK_LIMIT`) |
+| `RLDX-1/run_scripts/export/eval_gr1_openvino.sh` | Closed-loop GR-1 Tabletop with the OV server and the reset protocol; `RECORD_DIR` for fixtures |
 | `RLDX-1/results/ov_bench/*.json` | Bench and parity reports |
 | `/tmp/rldx11_libero_img_ov_a64`, `/tmp/rldx11_libero_img_ov_a64_int8` | f16 and INT8 IRs (in `/tmp`; move them out to keep them) |
 | `/tmp/ov_profile.py` | Per-layer GPU profile script (`PERF_COUNT`) |
@@ -614,7 +814,7 @@ Latency:
 - [ ] Profile the padded INT8 IR to see where the remaining 37 ms goes (action model vs text vs vision).
 - [ ] Try INT4 (`int4_sym --group-size 128 --ratio ...`) on the text MLPs, which are bandwidth-bound.
 - [ ] Check smaller costs: `masked_scatter/NonZero` (0.77 ms), Transpose/permute (~1 ms).
-- [ ] Test OV `ACTIVATIONS_SCALE_FACTOR` as a replacement for the manual 1/16 residual rescale (needs a
+- [ ] Test OV `ACTIVATIONS_SCALE_FACTOR` as a replacement for the manual residual rescale (needs a
       `--no-f16-safe` export).
 
 RoboCasa (the benchmark RLDX's `docs/optimization.md` table uses: `RLDX-1.1-FT-ROBOCASA`, 3 cameras × 4
@@ -637,6 +837,19 @@ frames, 24 kitchen tasks × 50 episodes, success 73.1 % `compile` / 71.4 % `any:
 - [ ] Torch baseline on the RTX 3090 with upstream `eval_robocasa.sh` (`N_GPUS=1`).
 - [x] Full protocol (`N_EPISODES=50`) for INT8 asym: 71.8 % (861/1,200).
 - [ ] Full protocol (`N_EPISODES=50`) for f16, to compare with INT8 asym per task (stove, microwave PnP).
+- [ ] Re-export with the VL-row rescale (the current IRs use 1/16) and re-check parity.
+
+GR-1 Tabletop (`RLDX-1.1-FT-GR1`, requested by upstream; 24 tasks × 50 episodes, reported 60.3 %):
+- [x] OV closed-loop runner `run_scripts/export/eval_gr1_openvino.sh` (upstream `eval_gr1.sh` untouched).
+- [ ] Set up the simulator (`INSTALL_FLASH_ATTN=0 setup_gr1.sh`) and download the checkpoint.
+- [ ] Export f16 (VL-row rescale), INT8 sym and INT8 asym; record the cognition-row peak before and after.
+- [ ] Optional: `--no-f16-safe` export to show the overflow on GPU f16.
+- [ ] Smoke runs (f16 with `RECORD_DIR`, INT8 sym, INT8 asym), then open-loop parity (f32, f16, INT8
+      sym and asym, torch bf16 / `any:fp8`).
+- [ ] Full protocol: OV f16 and OV INT8 asym on the B70, torch bf16 (`eval_gr1.sh`, `N_GPUS=1`) on the 3090.
+- [ ] Latency: `bench` for f16, INT8 sym and INT8 asym on the B70 (and B390), torch `compile` on the 3090,
+      `benchmark_app` on the B70.
+- [ ] Same three runs on RoboCasa with the new rescale, and report both benchmarks to upstream.
 
 Engineering:
 - [ ] Batch > 1 export, so `N_ENVS=5` works and throughput can be measured.
