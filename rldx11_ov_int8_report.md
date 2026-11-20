@@ -17,6 +17,10 @@ protocol, a single episode, well inside run-to-run noise. Both are close to the 
 `RLDX-1.1-FT-LIBERO` (a different checkpoint and episode count). The open-loop parity max-diff misses
 our 5e-2 bar, but mean error and cosine are small, and the closed loop shows no practical loss.
 
+RoboCasa (`RLDX-1.1-FT-ROBOCASA`, full upstream protocol, 1,200 episodes): INT8 asym on the B70 scores
+**71.8 %**, between upstream's 73.1 % `compile` and 71.4 % `any:fp8` on Thor, at 89.6 ms per call vs
+107.3 ms for f16.
+
 ## Setup
 
 | Item | Value |
@@ -498,6 +502,92 @@ For a torch baseline on the 3090, use the upstream launcher unchanged:
 environments per process, then its swap chain). `N_EPISODES` and `TASK_LIMIT` work the same way for
 smoke runs.
 
+### Result: INT8 asym, full protocol (24 tasks × 50 episodes)
+
+```bash
+N_EPISODES=50 bash $R rldx11_ov_int8asym exports/rldx11_robocasa_ov_a64_int8asym GPU.0
+```
+
+Same export, device, f16 inference precision and protocol as the 10-episode run (the manifest is
+unchanged), 5 lanes × 10 episodes per task. The run directory held no earlier episodes (every lane logged
+`Detected 0 recorded episode(s)`), so all 1,200 episodes were run fresh here instead of resuming the
+10-episode run. Outputs are in `output_final/robocasa/rldx11_ov_int8asym/` (`summary.csv`, and
+`simulation_results.csv`, `eval.log` and videos per task).
+
+| | Value |
+|---|---|
+| **Success** | **71.8 % (861/1,200)** |
+| 95 % binomial interval | about ±2.5 points (69.2 % to 74.3 %) |
+| Upstream, same checkpoint (Thor, 1,200 episodes, mean of 2 runs) | 73.1 % `compile` (-1.3 points), 71.4 % `any:fp8` (+0.4 points); README 72.3 % |
+| Policy calls | 30,560 (mean 25.5 per episode) |
+| Wall time | about 4 h 12 min (19:18 to 23:31), `MAX_PARALLEL=4` |
+| Server errors / rejected requests | none (no error or traceback in `server.log` or any `eval.log`) |
+
+INT8 asym on the B70 reproduces upstream on the full protocol. 71.8 % falls between upstream's `compile`
+and `any:fp8` scores and is closest to `any:fp8`, the W8A8 preset it is meant to match. All three upstream
+numbers are inside the interval. A 1.3-point gap to `compile` is too small to resolve with 1,200 episodes.
+Upstream ran 5 environments per process, while this run used batch 1 per lane. Both setups use the
+same 1,200 scenes.
+
+By task family (the 10-episode column is the separate run above):
+
+| Family | Tasks | Success, 50 ep | Success, 10 ep |
+|---|---|---|---|
+| Drawer (open/close) | 2 | 95.0 % (95/100) | 95.0 % |
+| Sink (faucet on/off, spout) | 3 | 94.7 % (142/150) | 100 % |
+| Microwave (on/off) | 2 | 90.0 % (90/100) | 95.0 % |
+| Doors (open/close, single/double) | 4 | 85.5 % (171/200) | 77.5 % |
+| Coffee (setup mug, serve mug, press button) | 3 | 74.7 % (112/150) | 66.7 % |
+| Pick and place | 8 | 55.0 % (220/400) | 55.0 % |
+| Stove (on/off) | 2 | 31.0 % (31/100) | 60.0 % |
+
+Per task, sorted by success. The mean policy calls are given over all episodes and over successful
+ones. The limit is 45 calls, or 63 for `OpenDoubleDoor`:
+
+| Task | Success | Rate | Mean calls (all / success) | 10-ep run |
+|---|---|---|---|---|
+| CloseDrawer | 50/50 | 100 % | 12.1 / 12.1 | 10/10 |
+| TurnOffMicrowave | 50/50 | 100 % | 14.8 / 14.8 | 10/10 |
+| CloseSingleDoor | 49/50 | 98 % | 16.9 / 16.3 | 10/10 |
+| CoffeePressButton | 49/50 | 98 % | 8.8 / 8.1 | 9/10 |
+| TurnSinkSpout | 49/50 | 98 % | 9.3 / 8.6 | 10/10 |
+| TurnOffSinkFaucet | 47/50 | 94 % | 15.4 / 13.5 | 10/10 |
+| TurnOnSinkFaucet | 46/50 | 92 % | 17.8 / 15.4 | 10/10 |
+| OpenDrawer | 45/50 | 90 % | 16.6 / 13.5 | 9/10 |
+| CloseDoubleDoor | 44/50 | 88 % | 26.8 / 24.3 | 6/10 |
+| CoffeeServeMug | 42/50 | 84 % | 24.4 / 20.5 | 7/10 |
+| PnPCounterToSink | 42/50 | 84 % | 28.9 / 25.9 | 7/10 |
+| OpenDoubleDoor | 40/50 | 80 % | 48.0 / 44.2 | 8/10 |
+| TurnOnMicrowave | 40/50 | 80 % | 21.2 / 15.2 | 9/10 |
+| OpenSingleDoor | 38/50 | 76 % | 23.4 / 16.6 | 7/10 |
+| PnPSinkToCounter | 37/50 | 74 % | 24.1 / 16.8 | 7/10 |
+| PnPStoveToCounter | 34/50 | 68 % | 25.9 / 17.0 | 7/10 |
+| PnPCounterToCab | 28/50 | 56 % | 28.3 / 15.2 | 8/10 |
+| PnPCounterToStove | 26/50 | 52 % | 33.3 / 22.5 | 8/10 |
+| CoffeeSetupMug | 21/50 | 42 % | 33.0 / 16.5 | 4/10 |
+| PnPCabToCounter | 19/50 | 38 % | 35.6 / 20.3 | 5/10 |
+| TurnOnStove | 19/50 | 38 % | 33.5 / 14.7 | 7/10 |
+| PnPMicrowaveToCounter | 18/50 | 36 % | 36.0 / 20.1 | 2/10 |
+| PnPCounterToMicrowave | 16/50 | 32 % | 39.4 / 27.6 | 0/10 |
+| TurnOffStove | 12/50 | 24 % | 37.6 / 14.1 | 5/10 |
+
+Observations:
+- All 339 failures ran to the step limit. No episode ended early, and nothing crashed or errored on the
+  server.
+- The stove is the weakest family: `TurnOffStove` 24 %, `TurnOnStove` 38 %. A successful stove episode is
+  short (about 14 calls), and every failure times out. The policy either turns the knob quickly or never
+  does. The 60 % in the 10-episode run came from a small sample.
+- Microwave pick and place is still weak (`PnPCounterToMicrowave` 32 %, `PnPMicrowaveToCounter` 36 %),
+  but not as bad as the 0/10 and 2/10 seen in the 10-episode run. Pick and place overall is 55.0 %, the
+  same as before.
+- Per lane (scene layout seed), success ranges from 166/240 (69.2 %, lane 3) to 177/240 (73.8 %, lane 2).
+  This spread is within the per-lane noise (about ±5.7 points).
+- Episodes 0 and 1 of every lane use the same seeds as the 10-episode run. Here they scored 182/240
+  (75.8 %), against 175/240 (72.9 %) then, with the same export, seeds and protocol. So the closed loop
+  is not bit-reproducible across runs. Differences of a few points between runs are expected.
+- This run alone cannot say whether the stove and microwave weakness comes from INT8 or from the
+  checkpoint. That needs the f16 run (or torch) on the same protocol.
+
 ## Artifacts
 
 | Path | What |
@@ -545,7 +635,8 @@ frames, 24 kitchen tasks × 50 episodes, success 73.1 % `compile` / 71.4 % `any:
 - [x] OV INT8 asym on the B70, `N_EPISODES=10`: 72.9 % (175/240).
 - [ ] OV f16 on the B70, `N_EPISODES=10`, same protocol, to compare with INT8 asym.
 - [ ] Torch baseline on the RTX 3090 with upstream `eval_robocasa.sh` (`N_GPUS=1`).
-- [ ] Full protocol (`N_EPISODES=50`) for INT8 asym and f16; resumes the 10-episode runs.
+- [x] Full protocol (`N_EPISODES=50`) for INT8 asym: 71.8 % (861/1,200).
+- [ ] Full protocol (`N_EPISODES=50`) for f16, to compare with INT8 asym per task (stove, microwave PnP).
 
 Engineering:
 - [ ] Batch > 1 export, so `N_ENVS=5` works and throughput can be measured.
