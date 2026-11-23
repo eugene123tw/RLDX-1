@@ -21,6 +21,10 @@ RoboCasa (`RLDX-1.1-FT-ROBOCASA`, full upstream protocol, 1,200 episodes): INT8 
 **71.8 %**, between upstream's 73.1 % `compile` and 71.4 % `any:fp8` on Thor, at 89.6 ms per call vs
 107.3 ms for f16.
 
+GR-1 Tabletop (`RLDX-1.1-FT-GR1`, full upstream protocol, 1,200 episodes): INT8 asym on the B70 scores
+**58.75 %** against upstream's 60.3 % (bf16 `compile`), inside the ±2.8-point interval. The OV f16 and
+torch bf16 runs on the same protocol are still to do.
+
 ## Setup
 
 | Item | Value |
@@ -784,8 +788,95 @@ baseline goes to `output_final/gr1_tabletop/RLWRLD_RLDX-1.1-FT-GR1/h8_uniform_ep
   identical runs).
 - Report upstream's 60.3 % alongside ours, but the bf16 baseline is our own run on the same scenes.
 
-**Status.** Not run yet. The submodule is not initialized, the GR-1 venv does not exist and the
-checkpoint is not downloaded on this machine.
+**Status.** Done: exports, the OV f16 smoke run with fixtures, f16 parity (above) and the INT8 asym
+full run (below). Not run yet: the OV f16 full run, the torch bf16 baseline, INT8 parity and latency.
+
+### Result: INT8 asym, full protocol (24 tasks × 50 episodes)
+
+```bash
+N_EPISODES=50 bash $R rldx11_gr1_ov_int8asym exports/rldx11_gr1_ov_a64_int8asym GPU.0
+```
+
+Export `exports/rldx11_gr1_ov_a64_int8asym` (`int8_asym`, `vl_row_scale` 1/64) on the B70 (`GPU.0`), f16
+inference precision (device default), seed 42, 5 lanes × 10 episodes per task, 8 actions per call,
+720 steps (90 calls), uniform timesteps, reset protocol on (5 s settle, seed manifest), `MAX_PARALLEL=4`.
+Outputs are in `output_final/gr1_tabletop/rldx11_gr1_ov_int8asym/`.
+
+| | Value |
+|---|---|
+| **Success** | **58.75 % (705/1,200)** |
+| 95 % binomial interval | about ±2.8 points (56.0 % to 61.5 %) |
+| Upstream, same checkpoint (torch bf16 `compile`, 1,200 episodes) | 60.3 % (-1.55 points) |
+| Policy calls | 66,931 (mean 55.8 per episode) |
+| Wall time | about 3 h 47 min (17:16 to 21:03), `MAX_PARALLEL=4` |
+| Seed-manifest substitutions | 130, as expected for a full run |
+| Server errors / rejected requests | none (no error or traceback in `server.log` or any `eval.log`) |
+
+INT8 asym is 1.55 points below upstream's 60.3 %. Upstream's number is inside the interval, so the gap
+is not resolvable at 1,200 episodes. This is the checkpoint with the largest f16 overflow (385k), and
+the run had no NaN-driven failures: every episode either succeeded or ran to the step limit.
+
+By task group:
+
+| Group | Tasks | Success |
+|---|---|---|
+| Articulated (put in drawer/cabinet/microwave, then close) | 6 | 60.0 % (180/300) |
+| Rearrangement (`PosttrainPnPNovel*`) | 18 | 58.3 % (525/900) |
+
+Rearrangement by destination:
+
+| Destination | Tasks | Success |
+|---|---|---|
+| Plate | 3 | 78.0 % (117/150) |
+| Basket | 2 | 65.0 % (65/100) |
+| Pot | 2 | 61.0 % (61/100) |
+| Pan | 2 | 60.0 % (60/100) |
+| Cardboard box | 3 | 58.7 % (88/150) |
+| Bowl | 2 | 54.0 % (54/100) |
+| Tiered basket | 2 | 44.0 % (44/100) |
+| Tiered shelf | 2 | 36.0 % (36/100) |
+
+Per task, sorted by success. The mean policy calls are given over all episodes and over successful
+ones. The limit is 90 calls:
+
+| Task | Success | Rate | Mean calls (all / success) |
+|---|---|---|---|
+| PosttrainPnPNovelFromPlateToPlateSplitA | 42/50 | 84 % | 36.4 / 26.2 |
+| PnPBottleToCabinetClose | 41/50 | 82 % | 52.3 / 44.0 |
+| PosttrainPnPNovelFromTrayToPlateSplitA | 40/50 | 80 % | 39.9 / 27.4 |
+| PnPCanToDrawerClose | 39/50 | 78 % | 49.1 / 37.6 |
+| PnPWineToCabinetClose | 39/50 | 78 % | 66.3 / 59.7 |
+| PosttrainPnPNovelFromPlacematToPlateSplitA | 35/50 | 70 % | 44.0 / 24.3 |
+| PosttrainPnPNovelFromPlacematToBasketSplitA | 33/50 | 66 % | 52.5 / 33.2 |
+| PosttrainPnPNovelFromCuttingboardToBasketSplitA | 32/50 | 64 % | 51.9 / 30.5 |
+| PosttrainPnPNovelFromTrayToCardboardboxSplitA | 32/50 | 64 % | 48.1 / 24.6 |
+| PosttrainPnPNovelFromTrayToPotSplitA | 31/50 | 62 % | 50.0 / 25.5 |
+| PosttrainPnPNovelFromCuttingboardToPanSplitA | 30/50 | 60 % | 51.5 / 25.8 |
+| PosttrainPnPNovelFromCuttingboardToPotSplitA | 30/50 | 60 % | 51.6 / 26.0 |
+| PosttrainPnPNovelFromPlateToPanSplitA | 30/50 | 60 % | 51.0 / 24.9 |
+| PosttrainPnPNovelFromCuttingboardToCardboardboxSplitA | 29/50 | 58 % | 56.1 / 31.6 |
+| PosttrainPnPNovelFromPlacematToBowlSplitA | 29/50 | 58 % | 51.9 / 24.4 |
+| PosttrainPnPNovelFromPlateToCardboardboxSplitA | 27/50 | 54 % | 53.9 / 23.2 |
+| PosttrainPnPNovelFromPlateToBowlSplitA | 25/50 | 50 % | 58.6 / 27.2 |
+| PnPMilkToMicrowaveClose | 24/50 | 48 % | 66.8 / 41.7 |
+| PosttrainPnPNovelFromCuttingboardToTieredbasketSplitA | 23/50 | 46 % | 62.1 / 29.3 |
+| PosttrainPnPNovelFromTrayToTieredbasketSplitA | 21/50 | 42 % | 65.4 / 31.5 |
+| PnPCupToDrawerClose | 19/50 | 38 % | 65.9 / 26.5 |
+| PosttrainPnPNovelFromTrayToTieredshelfSplitA | 19/50 | 38 % | 67.0 / 29.5 |
+| PnPPotatoToMicrowaveClose | 18/50 | 36 % | 77.0 / 53.8 |
+| PosttrainPnPNovelFromPlacematToTieredshelfSplitA | 17/50 | 34 % | 69.0 / 28.3 |
+
+Observations:
+- All 495 failures ran to the step limit (90 calls). No episode ended early, and nothing crashed or
+  errored on the server.
+- The weak spots are tiered destinations (shelf 36 %, basket 44 %), the microwave tasks (milk 48 %,
+  potato 36 %) and `PnPCupToDrawerClose` (38 %). Plate destinations are the easiest (78 %).
+- Per lane (scene layout seed), success ranges from 127/240 (52.9 %, lane 1) to 151/240 (62.9 %,
+  lane 2). This spread is within the per-lane noise (about ±6.2 points).
+- Against the OV f16 smoke run (episode 0 of every lane, same scenes): `PnPCanToDrawerClose` 5/5 in
+  both, `PnPCupToDrawerClose` 0/5 here vs 1/5 for f16. Five episodes say nothing about precision.
+- This run alone cannot say whether the 1.55-point gap or the weak tasks come from INT8 or from the
+  checkpoint. That needs the OV f16 and torch bf16 runs on the same protocol.
 
 ## Artifacts
 
